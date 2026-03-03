@@ -165,6 +165,55 @@ chr3    45000000   45800000   DUP    22
 
 Columns: `chrom  start  end  svtype  num_probes`
 
+## Data Sources & Citations
+
+This project relies on the following data sources and publications:
+
+> **Schloissnig, S., Pani, S. et al.** Long-read sequencing and structural
+> variant characterization in 1,019 samples from the 1000 Genomes Project.
+> *bioRxiv* 2024.04.18.590093 (2024).
+> doi:[10.1101/2024.04.18.590093](https://doi.org/10.1101/2024.04.18.590093)
+> — [PubMed](https://pubmed.ncbi.nlm.nih.gov/38659906/)
+
+| Resource | Description |
+|----------|-------------|
+| [1KG ONT Vienna data collection][1kgp_ont] | Population-scale long-read SV calls from Oxford Nanopore sequencing of 1,019 1000 Genomes samples. |
+| [shapeit5-phased callset][phased_vcf] | The phased, sequence-resolved SV VCF used as the primary training truth set (included in `resources/`). |
+| [PMC12350158](https://pmc.ncbi.nlm.nih.gov/articles/PMC12350158/) | Curated structural variant truth sets. |
+
+### Samples for methods development and evaluation
+
+A subset of 1KG_ONT_VIENNA genomes overlap with samples analysed by the Human
+Genome Structural Variation Consortium and are designated for methods
+development and evaluation prior to publication by the project team:
+
+> HG00268, HG00513, HG00731, HG02554, HG02953, NA12878, NA19129, NA19238,
+> NA19331, NA19347
+
+A subset VCF containing only these 10 samples is provided in
+`tests/fixtures/test_samples.vcf.gz` for use in integration testing.
+
+If you use this software or its data resources, please cite the publication
+above and see [`CITATION.cff`](CITATION.cff) for machine-readable citation
+metadata.
+
+## Docker
+
+A Docker image containing all dependencies is published automatically via
+GitHub Actions. To build locally:
+
+```bash
+docker build -t array_cnv_caller .
+```
+
+## Testing
+
+```bash
+pip install pytest
+pytest tests/ -v              # all tests
+pytest tests/ -v -m integration  # integration tests only
+```
+
 ## License
 
 See [LICENSE](LICENSE).

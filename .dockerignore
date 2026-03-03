@@ -1,0 +1,13 @@
+.git
+.idea
+__pycache__
+*.pyc
+*.pyo
+*.pt
+*.egg-info
+dist
+build
+.eggs
+truth_sets
+tests
+.github
