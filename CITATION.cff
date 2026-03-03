@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software, please cite the data sources and
+  publications that made it possible.
+title: array_cnv_caller
+version: 0.1.0
+license: MIT
+repository-code: https://github.com/jlanej/array_cnv_caller
+
+references:
+  - type: article
+    title: >-
+      Long-read sequencing and structural variant characterization in
+      1,019 samples from the 1000 Genomes Project
+    authors:
+      - family-names: Schloissnig
+        given-names: Siegfried
+      - family-names: Pani
+        given-names: Samarendra
+    year: 2024
+    doi: 10.1101/2024.04.18.590093
+    url: https://pubmed.ncbi.nlm.nih.gov/38659906/
+    journal: bioRxiv
+    notes: >-
+      Primary data source for training truth sets. The shapeit5-phased
+      structural variant callset from the 1000 Genomes ONT Vienna
+      project is included in resources/ and used to derive per-sample
+      DEL/DUP truth labels. Samples for methods development and
+      evaluation: HG00268, HG00513, HG00731, HG02554, HG02953,
+      NA12878, NA19129, NA19238, NA19331, NA19347.
