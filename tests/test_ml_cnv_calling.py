@@ -318,7 +318,7 @@ class TestCLIParser:
         assert args.bcf == "test.bcf"
         assert args.truth_bed == "truth.bed"
 
-    def test_train_multisamle(self):
+    def test_train_multisample(self):
         parser = build_parser()
         args = parser.parse_args(
             [
