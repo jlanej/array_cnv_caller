@@ -7,3 +7,6 @@ dist/
 build/
 *.egg
 .eggs/
+
+# Generated truth set outputs (BED files, summaries)
+truth_sets/

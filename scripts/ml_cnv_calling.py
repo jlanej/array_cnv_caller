@@ -18,16 +18,14 @@ The model accepts three input channels per probe:
 3. **Distance** – log10-scaled genomic distance to the next probe, making the
    model robust to varying Illumina array probe densities.
 
-It predicts one of five copy-number states for each probe:
+It predicts one of three CNV classes for each probe:
 
-    CN 0 – homozygous deletion
-    CN 1 – heterozygous deletion
-    CN 2 – normal diploid
-    CN 3 – heterozygous duplication
-    CN 4 – homozygous duplication (or higher gain)
+    DEL    (class 0) – deletion
+    NORMAL (class 1) – normal diploid
+    DUP    (class 2) – duplication
 
 Training uses **weighted cross-entropy loss** to counter the heavy class
-imbalance toward CN = 2.
+imbalance toward the NORMAL class.
 
 CLI
 ~~~
@@ -40,8 +38,8 @@ CLI
 
     python scripts/ml_cnv_calling.py predict --bcf in.bcf --model model.pt     --output calls.bed
 
-Truth-set BED files are produced by ``scripts/prepare_truth_set.sh`` from the
-1000 Genomes ONT Vienna curated SV callset.
+Truth-set BED files are produced by ``scripts/prepare_truth_set.py`` from the
+1000 Genomes ONT Vienna shapeit5-phased SV callset.
 """
 
 from __future__ import annotations
@@ -62,7 +60,12 @@ from torch.utils.data import ConcatDataset, DataLoader, Dataset
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-CN_STATES = 5  # 0, 1, 2, 3, 4
+NUM_CLASSES = 3  # DEL=0, NORMAL=1, DUP=2
+CLASS_DEL = 0
+CLASS_NORMAL = 1
+CLASS_DUP = 2
+CLASS_NAMES = {CLASS_DEL: "DEL", CLASS_NORMAL: "NORMAL", CLASS_DUP: "DUP"}
+SVTYPE_TO_CLASS = {"DEL": CLASS_DEL, "DUP": CLASS_DUP}
 INPUT_CHANNELS = 3  # LRR, BAF, distance
 DEFAULT_WINDOW = 512  # probes per training window
 DEFAULT_STRIDE = 256
@@ -93,7 +96,7 @@ class CNVSegmenter(nn.Module):
     lstm_layers : int
         Number of stacked LSTM layers.
     num_classes : int
-        Number of copy-number classes to predict.
+        Number of output classes (DEL, NORMAL, DUP).
     dropout : float
         Dropout probability applied between CNN and LSTM layers.
     """
@@ -105,7 +108,7 @@ class CNVSegmenter(nn.Module):
         cnn_layers: int = 3,
         lstm_hidden: int = 128,
         lstm_layers: int = 2,
-        num_classes: int = CN_STATES,
+        num_classes: int = NUM_CLASSES,
         dropout: float = 0.2,
     ) -> None:
         super().__init__()
@@ -244,31 +247,31 @@ def compute_distance_channel(df: pd.DataFrame) -> np.ndarray:
 def assign_cn_labels(
     probes: pd.DataFrame, truth_bed: str, min_probes: int = 0
 ) -> Tuple[np.ndarray, Dict[str, int]]:
-    """Label each probe with a CN state using a truth-set BED file.
+    """Label each probe with a class using a truth-set BED file.
 
-    The BED file columns are: chrom  start  end  CN  [svtype]
+    The BED file columns are: chrom  start  end  svtype
+    where svtype is ``DEL`` or ``DUP``.
 
-    Probes overlapping a truth region inherit its CN; all others are
-    labelled CN = 2 (normal diploid).  Truth regions overlapping fewer
-    than *min_probes* array probes are excluded from labelling.
+    Probes overlapping a truth region inherit its class (DEL=0 or DUP=2);
+    all others are labelled NORMAL (class 1).  Truth regions overlapping
+    fewer than *min_probes* array probes are excluded from labelling.
 
     Returns
     -------
     labels : np.ndarray
-        Per-probe CN labels (int64).
+        Per-probe class labels (int64): 0=DEL, 1=NORMAL, 2=DUP.
     stats : dict
         ``total_regions``, ``used_regions``, ``skipped_regions``,
-        ``probes_labeled`` (count of non-CN-2 probes).
+        ``probes_labeled`` (count of non-NORMAL probes).
     """
     truth = pd.read_csv(
         truth_bed,
         sep="\t",
         header=None,
-        names=["chrom", "start", "end", "cn", "svtype"],
-        usecols=[0, 1, 2, 3],
-        dtype={"chrom": str, "start": int, "end": int, "cn": int},
+        names=["chrom", "start", "end", "svtype"],
+        dtype={"chrom": str, "start": int, "end": int, "svtype": str},
     )
-    labels = np.full(len(probes), 2, dtype=np.int64)
+    labels = np.full(len(probes), CLASS_NORMAL, dtype=np.int64)
 
     total_regions = 0
     used_regions = 0
@@ -282,19 +285,24 @@ def assign_cn_labels(
 
         for _, row in t_chrom.iterrows():
             total_regions += 1
+            svtype = row["svtype"]
+            if svtype not in SVTYPE_TO_CLASS:
+                skipped_regions += 1
+                continue
+            class_label = SVTYPE_TO_CLASS[svtype]
             overlap = (p_pos >= row["start"]) & (p_pos <= row["end"])
             n_overlap = int(overlap.sum())
             if n_overlap < min_probes:
                 skipped_regions += 1
                 continue
             used_regions += 1
-            labels[p_idx[overlap]] = row["cn"]
+            labels[p_idx[overlap]] = class_label
 
     stats = {
         "total_regions": total_regions,
         "used_regions": used_regions,
         "skipped_regions": skipped_regions,
-        "probes_labeled": int((labels != 2).sum()),
+        "probes_labeled": int((labels != CLASS_NORMAL).sum()),
     }
     return labels, stats
 
@@ -408,11 +416,11 @@ class ProbeDataset(Dataset):
 # ===================================================================
 def compute_class_weights(labels: np.ndarray) -> torch.Tensor:
     """Inverse-frequency class weights for weighted cross-entropy."""
-    counts = np.bincount(labels, minlength=CN_STATES).astype(np.float64)
+    counts = np.bincount(labels, minlength=NUM_CLASSES).astype(np.float64)
     counts = np.clip(counts, 1, None)  # avoid division by zero
     weights = 1.0 / counts
     weights /= weights.sum()
-    weights *= CN_STATES
+    weights *= NUM_CLASSES
     return torch.tensor(weights, dtype=torch.float32)
 
 
@@ -557,9 +565,9 @@ def train_model(
         )
 
         cn_values, cn_counts = np.unique(labels, return_counts=True)
-        cn_dist = dict(zip(cn_values, cn_counts))
+        class_dist = {CLASS_NAMES.get(v, v): c for v, c in zip(cn_values, cn_counts)}
         LOG.info(
-            "Loaded %d probes – CN distribution: %s", len(probes), cn_dist
+            "Loaded %d probes – class distribution: %s", len(probes), class_dist
         )
         LOG.info(
             "Truth regions: %d used, %d skipped (min_probes=%d)",
@@ -605,7 +613,7 @@ def train_model(
         for xb, yb in train_dl:
             xb, yb = xb.to(device), yb.to(device)
             logits = model(xb)  # (B, W, C)
-            loss = criterion(logits.reshape(-1, CN_STATES), yb.reshape(-1))
+            loss = criterion(logits.reshape(-1, NUM_CLASSES), yb.reshape(-1))
             optimiser.zero_grad()
             loss.backward()
             optimiser.step()
@@ -622,7 +630,7 @@ def train_model(
                 xb, yb = xb.to(device), yb.to(device)
                 logits = model(xb)
                 loss = criterion(
-                    logits.reshape(-1, CN_STATES), yb.reshape(-1)
+                    logits.reshape(-1, NUM_CLASSES), yb.reshape(-1)
                 )
                 val_loss += loss.item() * xb.size(0)
                 preds = logits.argmax(dim=-1)
@@ -684,7 +692,7 @@ def predict_cnv(
     )  # (N, 3)
 
     n = len(features)
-    vote_counts = np.zeros((n, CN_STATES), dtype=np.float64)
+    vote_counts = np.zeros((n, NUM_CLASSES), dtype=np.float64)
 
     # -- Sliding window inference -------------------------------------------
     with torch.no_grad():
@@ -709,8 +717,8 @@ def predict_cnv(
     segments: list[dict] = []
     i = 0
     while i < n:
-        cn = int(predictions[i])
-        if cn == 2:
+        cls = int(predictions[i])
+        if cls == CLASS_NORMAL:
             i += 1
             continue
         chrom = probes.iloc[i]["chrom"]
@@ -718,7 +726,7 @@ def predict_cnv(
         j = i + 1
         while (
             j < n
-            and int(predictions[j]) == cn
+            and int(predictions[j]) == cls
             and probes.iloc[j]["chrom"] == chrom
         ):
             j += 1
@@ -729,7 +737,7 @@ def predict_cnv(
                 "chrom": chrom,
                 "start": start,
                 "end": end,
-                "cn": cn,
+                "svtype": CLASS_NAMES[cls],
                 "num_probes": num_probes,
             }
         )
@@ -740,13 +748,13 @@ def predict_cnv(
     if seg_df.empty:
         LOG.info("No CNV segments predicted.")
         seg_df = pd.DataFrame(
-            columns=["chrom", "start", "end", "cn", "num_probes"]
+            columns=["chrom", "start", "end", "svtype", "num_probes"]
         )
     seg_df.to_csv(output_path, sep="\t", index=False, header=False)
     LOG.info(
         "Wrote %d CNV segments (%d non-diploid probes) to %s",
         len(seg_df),
-        int((predictions != 2).sum()),
+        int((predictions != CLASS_NORMAL).sum()),
         output_path,
     )
 
@@ -775,7 +783,7 @@ def build_parser() -> argparse.ArgumentParser:
     truth_grp = p_train.add_mutually_exclusive_group(required=True)
     truth_grp.add_argument(
         "--truth-bed",
-        help="Single truth-set BED file (chrom start end CN [svtype]).  "
+        help="Single truth-set BED file (chrom start end svtype).  "
         "Use with --sample for single-sample training.",
     )
     truth_grp.add_argument(

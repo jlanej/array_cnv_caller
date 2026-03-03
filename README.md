@@ -24,8 +24,11 @@ The curated training set is sourced from:
   structural variant truth sets.
 * [1KG ONT Vienna FTP][1kgp_ont] – population-scale long-read SV calls from
   the 1000 Genomes Project.
+* [shapeit5-phased callset][phased_vcf] – the phased, sequence-resolved SV VCF
+  used as the primary training truth set, included in `resources/`.
 
 [1kgp_ont]: https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/1KG_ONT_VIENNA/
+[phased_vcf]: https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/1KG_ONT_VIENNA/release/v1.1/shapeit5-phased-callset/shapeit5-phased-callset_final-vcf.phased.vcf.gz
 
 ---
 
@@ -43,7 +46,7 @@ The `CNVSegmenter` model is a sequence-to-sequence architecture:
 |-------|-------------|
 | **1-D CNN** | Stacked convolutional layers extract local features and smooth noisy LRR/BAF signals. |
 | **Bi-LSTM** | Bidirectional LSTM layers capture long-range genomic context and sharpen copy-number transition boundaries. |
-| **FC head** | A fully connected layer predicts one of 5 copy-number states (CN 0–4) per probe. |
+| **FC head** | A fully connected layer predicts one of 3 CNV classes (DEL, NORMAL, DUP) per probe. |
 
 The model accepts **three input channels** per probe:
 
@@ -55,29 +58,38 @@ Encoding inter-probe distance explicitly makes the model **robust to different
 Illumina array probe densities** (e.g. Omni2.5 vs. GSA vs. Mega).
 
 Training uses **weighted cross-entropy loss** to handle the extreme class
-imbalance inherent in array data (the vast majority of probes are CN = 2).
+imbalance inherent in array data (the vast majority of probes are NORMAL).
 
 ### Truth Set Preparation
 
-The training labels come from the 1000 Genomes ONT Vienna release.  The helper
-script downloads the merged Sniffles2 SV VCF and converts DEL/DUP calls into
-per-sample BED files with copy-number labels:
+Training labels come from the 1000 Genomes ONT Vienna shapeit5-phased SV
+callset.  The phased VCF is included in `resources/` and the Python helper
+script parses it into per-sample BED files:
 
 ```bash
-bash scripts/prepare_truth_set.sh [output_dir]
+python scripts/prepare_truth_set.py \
+    --vcf resources/shapeit5-phased-callset_final-vcf.phased.vcf.gz \
+    --output-dir truth_sets \
+    --min-size 1000
 ```
 
-Output BED format:  `chrom  start  end  CN  svtype`
+The script:
 
-CN mapping:
+* Derives SV type (DEL/DUP) from the variant ID field (sequence-resolved
+  variants have no INFO/SVTYPE).
+* Filters to DEL and DUP variants ≥ 1 kb.
+* Writes per-sample BED files and a comprehensive summary of SV types
+  included/excluded plus global metrics for comparison with the publication.
 
-| Genotype | SV type | CN |
-|----------|---------|----|
-| hom DEL  | DEL     | 0  |
-| het DEL  | DEL     | 1  |
-| normal   | —       | 2  |
-| het DUP  | DUP     | 3  |
-| hom DUP  | DUP     | 4  |
+Output BED format:  `chrom  start  end  svtype`
+
+Class mapping:
+
+| SV type | Class | Label |
+|---------|-------|-------|
+| DEL     | 0     | Deletion |
+| —       | 1     | Normal diploid |
+| DUP     | 2     | Duplication |
 
 ### Installation
 
@@ -103,7 +115,7 @@ python scripts/ml_cnv_calling.py train \
 When training on a multi-sample BCF (e.g. the ~2,141-sample BCF produced by
 [`process_1000g.sh`](https://github.com/jlanej/illumina_idat_processing/blob/main/scripts/process_1000g.sh)),
 use `--truth-dir` to point at the directory of per-sample BED files created by
-`prepare_truth_set.sh`.  The script automatically matches BCF sample names to
+`prepare_truth_set.py`.  The script automatically matches BCF sample names to
 `<sample>.bed` files and trains on all matched samples:
 
 ```bash
@@ -143,15 +155,15 @@ python scripts/ml_cnv_calling.py predict \
 ```
 
 The output is a tab-separated BED file of predicted CNV regions – adjacent
-probes sharing the same non-diploid state (CN ≠ 2) are collapsed into
-contiguous segments:
+probes sharing the same non-normal class are collapsed into contiguous
+segments:
 
 ```
-chr1    1500000    2300000    1    47
-chr3    45000000   45800000   3    22
+chr1    1500000    2300000    DEL    47
+chr3    45000000   45800000   DUP    22
 ```
 
-Columns: `chrom  start  end  CN  num_probes`
+Columns: `chrom  start  end  svtype  num_probes`
 
 ## License
 
