@@ -31,7 +31,13 @@ imbalance toward CN = 2.
 
 CLI
 ~~~
+    # Single-sample training
     python scripts/ml_cnv_calling.py train   --bcf in.bcf --truth-bed truth.bed --output model.pt
+
+    # Multi-sample training (auto-matches BCF samples to per-sample BEDs)
+    python scripts/ml_cnv_calling.py train   --bcf multi.bcf --truth-dir truth_sets/per_sample/ \\
+        --min-probes 5 --overlap-report overlap.tsv --output model.pt
+
     python scripts/ml_cnv_calling.py predict --bcf in.bcf --model model.pt     --output calls.bed
 
 Truth-set BED files are produced by ``scripts/prepare_truth_set.sh`` from the
@@ -43,7 +49,6 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import sys
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -52,8 +57,7 @@ import pysam
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -65,6 +69,7 @@ DEFAULT_STRIDE = 256
 DEFAULT_EPOCHS = 30
 DEFAULT_LR = 1e-3
 DEFAULT_BATCH = 32
+DEFAULT_MIN_PROBES = 1
 
 LOG = logging.getLogger(__name__)
 
@@ -237,14 +242,23 @@ def compute_distance_channel(df: pd.DataFrame) -> np.ndarray:
 
 
 def assign_cn_labels(
-    probes: pd.DataFrame, truth_bed: str
-) -> np.ndarray:
+    probes: pd.DataFrame, truth_bed: str, min_probes: int = 0
+) -> Tuple[np.ndarray, Dict[str, int]]:
     """Label each probe with a CN state using a truth-set BED file.
 
     The BED file columns are: chrom  start  end  CN  [svtype]
 
     Probes overlapping a truth region inherit its CN; all others are
-    labelled CN = 2 (normal diploid).
+    labelled CN = 2 (normal diploid).  Truth regions overlapping fewer
+    than *min_probes* array probes are excluded from labelling.
+
+    Returns
+    -------
+    labels : np.ndarray
+        Per-probe CN labels (int64).
+    stats : dict
+        ``total_regions``, ``used_regions``, ``skipped_regions``,
+        ``probes_labeled`` (count of non-CN-2 probes).
     """
     truth = pd.read_csv(
         truth_bed,
@@ -256,6 +270,10 @@ def assign_cn_labels(
     )
     labels = np.full(len(probes), 2, dtype=np.int64)
 
+    total_regions = 0
+    used_regions = 0
+    skipped_regions = 0
+
     for chrom in truth["chrom"].unique():
         t_chrom = truth[truth["chrom"] == chrom]
         p_mask = probes["chrom"] == chrom
@@ -263,10 +281,85 @@ def assign_cn_labels(
         p_idx = probes.loc[p_mask].index.values
 
         for _, row in t_chrom.iterrows():
+            total_regions += 1
             overlap = (p_pos >= row["start"]) & (p_pos <= row["end"])
+            n_overlap = int(overlap.sum())
+            if n_overlap < min_probes:
+                skipped_regions += 1
+                continue
+            used_regions += 1
             labels[p_idx[overlap]] = row["cn"]
 
-    return labels
+    stats = {
+        "total_regions": total_regions,
+        "used_regions": used_regions,
+        "skipped_regions": skipped_regions,
+        "probes_labeled": int((labels != 2).sum()),
+    }
+    return labels, stats
+
+
+def get_bcf_samples(bcf_path: str) -> List[str]:
+    """Return the list of sample names from a BCF/VCF header."""
+    vcf = pysam.VariantFile(bcf_path)
+    samples = list(vcf.header.samples)
+    vcf.close()
+    return samples
+
+
+def match_samples(
+    bcf_path: str, truth_dir: str
+) -> Tuple[List[str], List[str], List[str]]:
+    """Match BCF sample names to per-sample truth BED files.
+
+    Truth BED files are expected as ``<truth_dir>/<sample>.bed``.
+
+    Returns
+    -------
+    matched : list[str]
+        Samples present in both the BCF and the truth directory.
+    bcf_only : list[str]
+        Samples only in the BCF (no truth data).
+    truth_only : list[str]
+        Samples only in the truth directory (not in BCF).
+    """
+    bcf_samples = set(get_bcf_samples(bcf_path))
+
+    truth_samples: set[str] = set()
+    for fname in os.listdir(truth_dir):
+        if fname.endswith(".bed"):
+            truth_samples.add(fname[:-4])
+
+    matched = sorted(bcf_samples & truth_samples)
+    bcf_only = sorted(bcf_samples - truth_samples)
+    truth_only = sorted(truth_samples - bcf_samples)
+    return matched, bcf_only, truth_only
+
+
+def write_overlap_report(
+    report_path: str,
+    matched: List[str],
+    bcf_only: List[str],
+    truth_only: List[str],
+) -> None:
+    """Write a TSV report of sample overlap between BCF and truth set."""
+    rows: list[dict] = []
+    for s in matched:
+        rows.append(
+            {"sample": s, "in_bcf": True, "in_truth": True, "status": "matched"}
+        )
+    for s in bcf_only:
+        rows.append(
+            {"sample": s, "in_bcf": True, "in_truth": False, "status": "bcf_only"}
+        )
+    for s in truth_only:
+        rows.append(
+            {"sample": s, "in_bcf": False, "in_truth": True, "status": "truth_only"}
+        )
+    df = pd.DataFrame(rows)
+    df.sort_values("sample", inplace=True)
+    df.to_csv(report_path, sep="\t", index=False)
+    LOG.info("Wrote overlap report (%d samples) to %s", len(df), report_path)
 
 
 # ===================================================================
@@ -325,9 +418,12 @@ def compute_class_weights(labels: np.ndarray) -> torch.Tensor:
 
 def train_model(
     bcf_path: str,
-    truth_bed: str,
     output_path: str,
+    truth_bed: Optional[str] = None,
+    truth_dir: Optional[str] = None,
     sample: Optional[str] = None,
+    min_probes: int = DEFAULT_MIN_PROBES,
+    overlap_report: Optional[str] = None,
     window: int = DEFAULT_WINDOW,
     stride: int = DEFAULT_STRIDE,
     epochs: int = DEFAULT_EPOCHS,
@@ -335,7 +431,19 @@ def train_model(
     batch_size: int = DEFAULT_BATCH,
     device_name: str = "auto",
 ) -> None:
-    """End-to-end training loop."""
+    """End-to-end training loop.
+
+    Supports two modes:
+
+    * **Single-sample** (``truth_bed``): one sample from the BCF is matched
+      to a single truth BED file.
+    * **Multi-sample** (``truth_dir``): the BCF sample names are matched
+      against per-sample BED files in *truth_dir* (``<sample>.bed``).
+      An overlap report is optionally written to *overlap_report*.
+    """
+
+    if not truth_bed and not truth_dir:
+        raise ValueError("Either --truth-bed or --truth-dir must be provided.")
 
     # -- Device -------------------------------------------------------------
     if device_name == "auto":
@@ -345,24 +453,132 @@ def train_model(
     LOG.info("Using device: %s", device)
 
     # -- Data ---------------------------------------------------------------
-    probes = read_bcf_probes(bcf_path, sample=sample)
-    labels = assign_cn_labels(probes, truth_bed)
-    distances = compute_distance_channel(probes)
+    if truth_dir:
+        # ── Multi-sample mode ─────────────────────────────────────────────
+        matched, bcf_only, truth_only = match_samples(bcf_path, truth_dir)
+        LOG.info(
+            "Sample overlap: %d matched, %d BCF-only, %d truth-only",
+            len(matched),
+            len(bcf_only),
+            len(truth_only),
+        )
 
-    features = np.column_stack(
-        [probes["lrr"].values, probes["baf"].values, distances]
-    )  # (N, 3)
+        if overlap_report:
+            write_overlap_report(overlap_report, matched, bcf_only, truth_only)
 
-    cn_values, cn_counts = np.unique(labels, return_counts=True)
-    cn_dist = dict(zip(cn_values, cn_counts))
-    LOG.info("Loaded %d probes – CN distribution: %s", len(probes), cn_dist)
+        if not matched:
+            raise ValueError(
+                f"No BCF samples match truth BED files in {truth_dir}"
+            )
 
-    # Train / validation split (by index, not shuffled – preserves order)
-    n = len(features)
-    split = int(0.9 * n)
-    train_ds = ProbeDataset(features[:split], labels[:split], window, stride)
-    val_ds = ProbeDataset(features[split:], labels[split:], window, stride)
+        all_features: list[np.ndarray] = []
+        all_labels: list[np.ndarray] = []
 
+        for i, s in enumerate(matched, 1):
+            LOG.info("Loading sample %d/%d: %s", i, len(matched), s)
+            bed_path = os.path.join(truth_dir, f"{s}.bed")
+            probes = read_bcf_probes(bcf_path, sample=s)
+            labels, stats = assign_cn_labels(
+                probes, bed_path, min_probes=min_probes
+            )
+
+            if stats["probes_labeled"] == 0:
+                LOG.warning(
+                    "  %s: 0 labeled probes after filtering "
+                    "(min_probes=%d), skipping.",
+                    s,
+                    min_probes,
+                )
+                continue
+
+            distances = compute_distance_channel(probes)
+            features = np.column_stack(
+                [probes["lrr"].values, probes["baf"].values, distances]
+            )
+            all_features.append(features)
+            all_labels.append(labels)
+            LOG.info(
+                "  %s: %d probes, %d/%d truth regions used, %d probes labeled",
+                s,
+                len(probes),
+                stats["used_regions"],
+                stats["total_regions"],
+                stats["probes_labeled"],
+            )
+
+        if not all_features:
+            raise ValueError(
+                "No samples with usable data after filtering."
+            )
+
+        # Train / val split by sample
+        n_samp = len(all_features)
+        if n_samp == 1:
+            train_idx, val_idx = [0], [0]
+        else:
+            rng = np.random.RandomState(42)
+            perm = rng.permutation(n_samp).tolist()
+            n_val = max(1, n_samp // 10)
+            train_idx = perm[:-n_val]
+            val_idx = perm[-n_val:]
+
+        train_datasets = [
+            ProbeDataset(all_features[i], all_labels[i], window, stride)
+            for i in train_idx
+        ]
+        val_datasets = [
+            ProbeDataset(all_features[i], all_labels[i], window, stride)
+            for i in val_idx
+        ]
+        train_ds = ConcatDataset(train_datasets)
+        val_ds = ConcatDataset(val_datasets)
+
+        all_train_labels = np.concatenate(
+            [all_labels[i] for i in train_idx]
+        )
+        LOG.info(
+            "Multi-sample: %d train samples (%d windows), "
+            "%d val samples (%d windows)",
+            len(train_idx),
+            len(train_ds),
+            len(val_idx),
+            len(val_ds),
+        )
+    else:
+        # ── Single-sample mode ────────────────────────────────────────────
+        probes = read_bcf_probes(bcf_path, sample=sample)
+        labels, stats = assign_cn_labels(
+            probes, truth_bed, min_probes=min_probes
+        )
+        distances = compute_distance_channel(probes)
+
+        features = np.column_stack(
+            [probes["lrr"].values, probes["baf"].values, distances]
+        )
+
+        cn_values, cn_counts = np.unique(labels, return_counts=True)
+        cn_dist = dict(zip(cn_values, cn_counts))
+        LOG.info(
+            "Loaded %d probes – CN distribution: %s", len(probes), cn_dist
+        )
+        LOG.info(
+            "Truth regions: %d used, %d skipped (min_probes=%d)",
+            stats["used_regions"],
+            stats["skipped_regions"],
+            min_probes,
+        )
+
+        n = len(features)
+        split = int(0.9 * n)
+        train_ds = ProbeDataset(
+            features[:split], labels[:split], window, stride
+        )
+        val_ds = ProbeDataset(
+            features[split:], labels[split:], window, stride
+        )
+        all_train_labels = labels[:split]
+
+    # -- DataLoaders --------------------------------------------------------
     train_dl = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True, num_workers=0
     )
@@ -372,7 +588,7 @@ def train_model(
 
     # -- Model & optimiser --------------------------------------------------
     model = CNVSegmenter().to(device)
-    class_weights = compute_class_weights(labels).to(device)
+    class_weights = compute_class_weights(all_train_labels).to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimiser = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -556,15 +772,38 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Input BCF/VCF with FORMAT/LRR and FORMAT/BAF.",
     )
-    p_train.add_argument(
+    truth_grp = p_train.add_mutually_exclusive_group(required=True)
+    truth_grp.add_argument(
         "--truth-bed",
-        required=True,
-        help="Truth-set BED file (chrom start end CN [svtype]).",
+        help="Single truth-set BED file (chrom start end CN [svtype]).  "
+        "Use with --sample for single-sample training.",
+    )
+    truth_grp.add_argument(
+        "--truth-dir",
+        help="Directory of per-sample truth BED files (<sample>.bed).  "
+        "Enables multi-sample training by auto-matching BCF samples.",
     )
     p_train.add_argument(
         "--output", "-o", default="cnv_model.pt", help="Output model path."
     )
-    p_train.add_argument("--sample", default=None, help="Sample name in BCF.")
+    p_train.add_argument(
+        "--sample",
+        default=None,
+        help="Sample name in BCF (single-sample mode only).",
+    )
+    p_train.add_argument(
+        "--min-probes",
+        type=int,
+        default=DEFAULT_MIN_PROBES,
+        help="Minimum number of array probes overlapping a truth region "
+        "for it to be included in training (default: %(default)s).",
+    )
+    p_train.add_argument(
+        "--overlap-report",
+        default=None,
+        help="Path to write a TSV sample-overlap report "
+        "(multi-sample mode only).",
+    )
     p_train.add_argument(
         "--window", type=int, default=DEFAULT_WINDOW, help="Window size."
     )
@@ -631,9 +870,12 @@ def main(argv: Optional[List[str]] = None) -> None:
     if args.command == "train":
         train_model(
             bcf_path=args.bcf,
-            truth_bed=args.truth_bed,
             output_path=args.output,
+            truth_bed=args.truth_bed,
+            truth_dir=args.truth_dir,
             sample=args.sample,
+            min_probes=args.min_probes,
+            overlap_report=args.overlap_report,
             window=args.window,
             stride=args.stride,
             epochs=args.epochs,

@@ -87,7 +87,7 @@ pip install -r requirements_ml.txt
 
 ### Usage
 
-#### Training
+#### Single-sample training
 
 ```bash
 python scripts/ml_cnv_calling.py train \
@@ -97,6 +97,41 @@ python scripts/ml_cnv_calling.py train \
     --epochs 30 \
     --device auto
 ```
+
+#### Multi-sample training
+
+When training on a multi-sample BCF (e.g. the ~2,141-sample BCF produced by
+[`process_1000g.sh`](https://github.com/jlanej/illumina_idat_processing/blob/main/scripts/process_1000g.sh)),
+use `--truth-dir` to point at the directory of per-sample BED files created by
+`prepare_truth_set.sh`.  The script automatically matches BCF sample names to
+`<sample>.bed` files and trains on all matched samples:
+
+```bash
+python scripts/ml_cnv_calling.py train \
+    --bcf multisample.bcf \
+    --truth-dir truth_sets/per_sample/ \
+    --min-probes 5 \
+    --overlap-report overlap.tsv \
+    --output cnv_model.pt
+```
+
+| Option | Description |
+|--------|-------------|
+| `--truth-dir` | Directory of `<sample>.bed` truth files (mutually exclusive with `--truth-bed`). |
+| `--min-probes N` | Exclude truth regions overlapping fewer than *N* array probes (default: 1). |
+| `--overlap-report` | Write a TSV listing every sample as `matched`, `bcf_only`, or `truth_only`. |
+
+The overlap report (`overlap.tsv`) has columns:
+
+```
+sample    in_bcf    in_truth    status
+HG00096   True      True        matched
+NA12878   True      False       bcf_only
+HG00099   False     True        truth_only
+```
+
+In multi-sample mode the train/validation split is by *sample* (90/10) to
+prevent data leakage.
 
 #### Prediction
 
