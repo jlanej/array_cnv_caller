@@ -9,8 +9,8 @@ This project implements a deep-learning CNV (Copy Number Variant) caller that
 operates on BAF (B-Allele Frequency) and LRR (Log R Ratio) signals produced by
 Illumina genotyping arrays.  Training labels are derived from the highly curated
 1000 Genomes ONT Vienna structural variant truth set – a population-scale
-catalogue of 167 000+ sequence-resolved SVs from Oxford Nanopore long-read
-sequencing of 1 019 samples ([data collection][1kgp_ont]).
+catalogue of 167,000+ sequence-resolved SVs from Oxford Nanopore long-read
+sequencing of 1,019 samples ([data collection][1kgp_ont]).
 
 Array data are prepared with the
 [illumina_idat_processing](https://github.com/jlanej/illumina_idat_processing)

@@ -305,9 +305,9 @@ class ProbeDataset(Dataset):
         e = s + self.window
         x = self.features[s:e].T  # (3, W)
         y = self.labels[s:e]
-        return torch.tensor(x, dtype=torch.float32), torch.tensor(
-            y, dtype=torch.long
-        )
+        x_tensor = torch.tensor(x, dtype=torch.float32)
+        y_tensor = torch.tensor(y, dtype=torch.long)
+        return x_tensor, y_tensor
 
 
 # ===================================================================
@@ -353,11 +353,9 @@ def train_model(
         [probes["lrr"].values, probes["baf"].values, distances]
     )  # (N, 3)
 
-    LOG.info(
-        "Loaded %d probes – CN distribution: %s",
-        len(probes),
-        dict(zip(*np.unique(labels, return_counts=True))),
-    )
+    cn_values, cn_counts = np.unique(labels, return_counts=True)
+    cn_dist = dict(zip(cn_values, cn_counts))
+    LOG.info("Loaded %d probes – CN distribution: %s", len(probes), cn_dist)
 
     # Train / validation split (by index, not shuffled – preserves order)
     n = len(features)
