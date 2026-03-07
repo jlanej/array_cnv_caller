@@ -175,6 +175,8 @@ MODEL_PATH="$OUTDIR/cnv_model.pt"
 OVERLAP_REPORT="$OUTDIR/overlap_report.tsv"
 PREDICTIONS_DIR="$OUTDIR/predictions"
 
+TOTAL_STEPS=$([ "$PREDICT" -eq 1 ] && echo '3' || echo '2')
+
 echo "============================================================"
 echo "  array_cnv_caller – Training Pipeline"
 echo "============================================================"
@@ -193,7 +195,7 @@ echo ""
 
 # ── Step 1: Prepare truth-set BED files ──────────────────────────────────
 echo "────────────────────────────────────────────────────────────"
-echo "  Step 1/$([ "$PREDICT" -eq 1 ] && echo '3' || echo '2'): Prepare truth-set BED files"
+echo "  Step 1/$TOTAL_STEPS: Prepare truth-set BED files"
 echo "────────────────────────────────────────────────────────────"
 
 if [[ -d "$TRUTH_DIR/per_sample" ]] && ls "$TRUTH_DIR/per_sample/"*.bed >/dev/null 2>&1; then
@@ -210,7 +212,7 @@ echo ""
 
 # ── Step 2: Train model ─────────────────────────────────────────────────
 echo "────────────────────────────────────────────────────────────"
-echo "  Step 2/$([ "$PREDICT" -eq 1 ] && echo '3' || echo '2'): Train CNVSegmenter model"
+echo "  Step 2/$TOTAL_STEPS: Train CNVSegmenter model"
 echo "────────────────────────────────────────────────────────────"
 
 run_cmd scripts/ml_cnv_calling.py train \
@@ -232,7 +234,7 @@ echo ""
 # ── Step 3 (optional): Predict CNVs ─────────────────────────────────────
 if [[ "$PREDICT" -eq 1 ]]; then
     echo "────────────────────────────────────────────────────────────"
-    echo "  Step 3/3: Predict CNVs for BCF samples"
+    echo "  Step 3/$TOTAL_STEPS: Predict CNVs for BCF samples"
     echo "────────────────────────────────────────────────────────────"
 
     mkdir -p "$PREDICTIONS_DIR"
