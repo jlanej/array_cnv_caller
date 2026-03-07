@@ -197,13 +197,140 @@ If you use this software or its data resources, please cite the publication
 above and see [`CITATION.cff`](CITATION.cff) for machine-readable citation
 metadata.
 
+## HPC Usage with Apptainer
+
+Most HPC clusters do not permit Docker but support
+[Apptainer](https://apptainer.org/) (the successor to Singularity).  A
+pre-built container image is available from GitHub Container Registry.  All
+scripts, Python dependencies, and the bundled truth-set VCF are pre-packed
+in the image — no local installation required.
+
+### Pulling the image
+
+```bash
+apptainer pull docker://ghcr.io/jlanej/array_cnv_caller:main
+```
+
+### Batteries-included training pipeline
+
+Run the full training workflow directly via Apptainer.  The pipeline
+orchestrates truth-set preparation, multi-sample training, and (optionally)
+prediction in a single command, targeting the ~2,141-sample 1000 Genomes BCF
+produced by
+[`process_1000g.sh`](https://github.com/jlanej/illumina_idat_processing/blob/main/scripts/process_1000g.sh)
+and the shapeit5-phased truth set bundled in the image.
+
+```bash
+# Full training pipeline
+apptainer exec --nv --bind $PWD array_cnv_caller_main.sif \
+    bash /app/scripts/run_pipeline.sh \
+    --bcf $PWD/1000g_multisample.bcf \
+    --outdir $PWD/pipeline_output \
+    --epochs 30 \
+    --min-probes 5
+
+# With prediction on every sample after training
+apptainer exec --nv --bind $PWD array_cnv_caller_main.sif \
+    bash /app/scripts/run_pipeline.sh \
+    --bcf $PWD/1000g_multisample.bcf \
+    --outdir $PWD/pipeline_output \
+    --predict
+```
+
+The pipeline:
+
+1. **Prepares truth-set BED files** from the shapeit5-phased SV VCF (skipped
+   if the output directory already contains BED files from a previous run).
+2. **Trains the CNVSegmenter** on every BCF sample that has a matching
+   truth BED file.  Samples are split 90/10 by sample for train/validation to
+   prevent data leakage.
+3. **(Optional)** Runs prediction on BCF samples using the trained model.
+
+Pipeline options:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--bcf` | *(required)* | Multi-sample BCF with FORMAT/LRR and FORMAT/BAF |
+| `--truth-vcf` | bundled | Override the default shapeit5-phased VCF |
+| `--outdir` | `pipeline_output` | Output directory |
+| `--epochs` | 30 | Training epochs |
+| `--batch-size` | 32 | Batch size |
+| `--lr` | 0.001 | Learning rate |
+| `--min-probes` | 5 | Min array probes per truth region |
+| `--device` | `auto` | `auto`, `cpu`, `cuda`, `cuda:0`, … |
+| `--predict` | off | Also run prediction after training |
+
+### Running individual steps
+
+Each step can also be called independently via Apptainer:
+
+```bash
+# Pulled via: apptainer pull docker://ghcr.io/jlanej/array_cnv_caller:main
+SIF=array_cnv_caller_main.sif
+
+# Prepare truth sets
+apptainer exec --bind $PWD $SIF \
+    python /app/scripts/prepare_truth_set.py \
+    --vcf /app/resources/shapeit5-phased-callset_final-vcf.phased.vcf.gz \
+    --output-dir $PWD/truth_sets
+
+# Train (multi-sample)
+apptainer exec --nv --bind $PWD $SIF \
+    python /app/scripts/ml_cnv_calling.py train \
+    --bcf $PWD/1000g_multisample.bcf \
+    --truth-dir $PWD/truth_sets/per_sample/ \
+    --min-probes 5 \
+    --overlap-report $PWD/overlap.tsv \
+    --output $PWD/cnv_model.pt
+
+# Predict
+apptainer exec --nv --bind $PWD $SIF \
+    python /app/scripts/ml_cnv_calling.py predict \
+    --bcf $PWD/sample.bcf \
+    --model $PWD/cnv_model.pt \
+    --output $PWD/cnv_calls.bed
+```
+
+> **GPU support:** Pass `--nv` to `apptainer exec` for NVIDIA GPU passthrough.
+
+### Example SLURM job script
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=array_cnv_train
+#SBATCH --output=train_%j.log
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --gres=gpu:1
+#SBATCH --time=24:00:00
+
+module load apptainer   # or: module load singularity
+
+SIF="$HOME/containers/array_cnv_caller_main.sif"
+
+apptainer exec --nv --bind /scratch:/scratch "$SIF" \
+    bash /app/scripts/run_pipeline.sh \
+    --bcf /scratch/$USER/1000g_multisample.bcf \
+    --outdir /scratch/$USER/cnv_output \
+    --epochs 30 \
+    --min-probes 5 \
+    --predict
+```
+
 ## Docker
 
 A Docker image containing all dependencies is published automatically via
-GitHub Actions. To build locally:
+GitHub Actions to `ghcr.io/jlanej/array_cnv_caller`.  To build locally:
 
 ```bash
 docker build -t array_cnv_caller .
+```
+
+For HPC use, pull the published image as an Apptainer SIF (see above):
+
+```bash
+apptainer pull docker://ghcr.io/jlanej/array_cnv_caller:main
 ```
 
 ## Testing
