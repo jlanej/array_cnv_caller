@@ -98,6 +98,9 @@ if [[ ! -f "$BCF" ]]; then
 fi
 
 # ── Detect app root (/app inside container, repo root otherwise) ─────────
+# When running inside the Docker/Apptainer image, scripts and resources
+# live under /app.  Outside the container, we resolve relative to the
+# repository checkout that contains this script.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [[ -d /app/scripts && -d /app/resources ]]; then
     APP_ROOT="/app"
@@ -111,7 +114,8 @@ if [[ -z "$TRUTH_VCF" ]]; then
 fi
 
 if [[ ! -f "$TRUTH_VCF" ]]; then
-    echo "Error: Truth VCF not found: $TRUTH_VCF" >&2
+    echo "Error: Truth VCF not found at default location: $TRUTH_VCF" >&2
+    echo "       Use --truth-vcf to specify a custom path." >&2
     exit 1
 fi
 

@@ -265,6 +265,7 @@ Pipeline options:
 Each step can also be called independently via Apptainer:
 
 ```bash
+# Pulled via: apptainer pull docker://ghcr.io/jlanej/array_cnv_caller:main
 SIF=array_cnv_caller_main.sif
 
 # Prepare truth sets
