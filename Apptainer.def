@@ -1,0 +1,78 @@
+Bootstrap: docker
+From: python:3.12-slim
+
+%labels
+    Maintainer jlanej
+    Description array_cnv_caller – Deep-learning CNV caller for Illumina array data
+    Version 0.1.0
+
+%post
+    # Install system dependencies required by pysam (htslib)
+    apt-get update && \
+        apt-get install -y --no-install-recommends \
+            gcc \
+            libc6-dev \
+            zlib1g-dev \
+            libbz2-dev \
+            liblzma-dev \
+            libcurl4-openssl-dev \
+            tabix \
+        && rm -rf /var/lib/apt/lists/*
+
+    # Install Python ML dependencies
+    pip install --no-cache-dir \
+        'torch>=2.6.0' \
+        'pysam>=0.22.0' \
+        'numpy>=1.24.0' \
+        'pandas>=2.0.0'
+
+    # Create /app layout
+    mkdir -p /app/scripts /app/resources
+
+%files
+    scripts/prepare_truth_set.py /app/scripts/prepare_truth_set.py
+    scripts/ml_cnv_calling.py    /app/scripts/ml_cnv_calling.py
+    resources/                   /app/resources/
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+
+%runscript
+    exec python "$@"
+
+%help
+    array_cnv_caller – Deep-learning CNV caller for Illumina array data.
+
+    This container packages a PyTorch 1-D CNN + Bidirectional LSTM model
+    that detects copy-number variants (DEL/DUP) from Illumina genotyping
+    array BAF/LRR signals.  Training labels are derived from the 1000
+    Genomes ONT Vienna shapeit5-phased SV truth set.
+
+    Quick-start (Apptainer / HPC)
+    ─────────────────────────────
+    # Build the SIF image
+    apptainer build array_cnv_caller.sif Apptainer.def
+
+    # Prepare truth-set BED files
+    apptainer run array_cnv_caller.sif \
+        scripts/prepare_truth_set.py \
+        --vcf resources/shapeit5-phased-callset_final-vcf.phased.vcf.gz \
+        --output-dir truth_sets
+
+    # Train (multi-sample)
+    apptainer run --nv array_cnv_caller.sif \
+        scripts/ml_cnv_calling.py train \
+        --bcf /path/to/multisample.bcf \
+        --truth-dir truth_sets/per_sample/ \
+        --output cnv_model.pt
+
+    # Predict
+    apptainer run --nv array_cnv_caller.sif \
+        scripts/ml_cnv_calling.py predict \
+        --bcf /path/to/sample.bcf \
+        --model cnv_model.pt \
+        --output cnv_calls.bed
+
+    Bind-mount data directories with -B / --bind:
+        apptainer run -B /scratch:/scratch array_cnv_caller.sif ...

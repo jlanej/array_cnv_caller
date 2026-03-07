@@ -197,6 +197,134 @@ If you use this software or its data resources, please cite the publication
 above and see [`CITATION.cff`](CITATION.cff) for machine-readable citation
 metadata.
 
+## HPC Usage with Apptainer
+
+Most HPC clusters do not permit Docker but support
+[Apptainer](https://apptainer.org/) (the successor to Singularity).  An
+`Apptainer.def` definition file is provided so you can build a portable SIF
+image that bundles the model code, Python dependencies, and the bundled truth
+set VCF.
+
+### Building the SIF image
+
+```bash
+apptainer build array_cnv_caller.sif Apptainer.def
+```
+
+### Batteries-included training pipeline
+
+`scripts/run_pipeline.sh` orchestrates the complete workflow – truth-set
+preparation, multi-sample training, and (optionally) prediction – in a single
+command.  It targets the ~2,141-sample 1000 Genomes BCF produced by
+[`process_1000g.sh`](https://github.com/jlanej/illumina_idat_processing/blob/main/scripts/process_1000g.sh)
+and the shapeit5-phased truth set bundled in the container.
+
+```bash
+# Full training pipeline via Apptainer
+bash scripts/run_pipeline.sh \
+    --bcf /path/to/1000g_multisample.bcf \
+    --sif array_cnv_caller.sif \
+    --outdir pipeline_output \
+    --epochs 30 \
+    --min-probes 5 \
+    --device auto
+
+# With prediction on every sample after training
+bash scripts/run_pipeline.sh \
+    --bcf /path/to/1000g_multisample.bcf \
+    --sif array_cnv_caller.sif \
+    --predict
+
+# Native execution (no container)
+bash scripts/run_pipeline.sh \
+    --bcf /path/to/1000g_multisample.bcf \
+    --native
+```
+
+The pipeline:
+
+1. **Prepares truth-set BED files** from the shapeit5-phased SV VCF (skipped
+   if the output directory already contains BED files from a previous run).
+2. **Trains the CNVSegmenter** on every BCF sample that has a matching
+   truth BED file.  Samples are split 90/10 by sample for train/validation to
+   prevent data leakage.
+3. **(Optional)** Runs prediction on BCF samples using the trained model.
+
+Pipeline options:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--bcf` | *(required)* | Multi-sample BCF with FORMAT/LRR and FORMAT/BAF |
+| `--sif` | — | Apptainer SIF image (use `--native` instead for bare-metal) |
+| `--native` | — | Run without a container |
+| `--truth-vcf` | bundled | Override the default shapeit5-phased VCF |
+| `--outdir` | `pipeline_output` | Output directory |
+| `--epochs` | 30 | Training epochs |
+| `--batch-size` | 32 | Batch size |
+| `--lr` | 0.001 | Learning rate |
+| `--min-probes` | 5 | Min array probes per truth region |
+| `--device` | `auto` | `auto`, `cpu`, `cuda`, `cuda:0`, … |
+| `--predict` | off | Also run prediction after training |
+| `--bind` | — | Extra Apptainer bind mounts (e.g. `/scratch:/scratch`) |
+
+### Running individual steps with Apptainer
+
+```bash
+# Prepare truth sets
+apptainer run array_cnv_caller.sif \
+    scripts/prepare_truth_set.py \
+    --vcf resources/shapeit5-phased-callset_final-vcf.phased.vcf.gz \
+    --output-dir truth_sets
+
+# Train (bind-mount your data directory)
+apptainer run --nv \
+    --bind /data:/data \
+    array_cnv_caller.sif \
+    scripts/ml_cnv_calling.py train \
+    --bcf /data/1000g_multisample.bcf \
+    --truth-dir truth_sets/per_sample/ \
+    --min-probes 5 \
+    --overlap-report overlap.tsv \
+    --output cnv_model.pt
+
+# Predict
+apptainer run --nv \
+    --bind /data:/data \
+    array_cnv_caller.sif \
+    scripts/ml_cnv_calling.py predict \
+    --bcf /data/sample.bcf \
+    --model cnv_model.pt \
+    --output cnv_calls.bed
+```
+
+> **GPU support:** Pass `--nv` to `apptainer run` for NVIDIA GPU passthrough.
+> The pipeline script does this automatically when `--device` is not `cpu`.
+
+### Example SLURM job script
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=array_cnv_train
+#SBATCH --output=train_%j.log
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --gres=gpu:1
+#SBATCH --time=24:00:00
+
+module load apptainer   # or: module load singularity
+
+bash scripts/run_pipeline.sh \
+    --bcf /scratch/$USER/1000g_multisample.bcf \
+    --sif array_cnv_caller.sif \
+    --outdir /scratch/$USER/cnv_output \
+    --epochs 30 \
+    --min-probes 5 \
+    --device auto \
+    --predict \
+    --bind /scratch:/scratch
+```
+
 ## Docker
 
 A Docker image containing all dependencies is published automatically via
@@ -204,6 +332,12 @@ GitHub Actions. To build locally:
 
 ```bash
 docker build -t array_cnv_caller .
+```
+
+The Docker image can also be converted to an Apptainer SIF for HPC use:
+
+```bash
+apptainer build array_cnv_caller.sif docker-daemon://array_cnv_caller:latest
 ```
 
 ## Testing

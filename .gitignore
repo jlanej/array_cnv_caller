@@ -11,5 +11,11 @@ build/
 # Generated truth set outputs (BED files, summaries)
 truth_sets/
 
+# Pipeline outputs
+pipeline_output/
+
+# Apptainer / Singularity images
+*.sif
+
 # Pytest cache
 .pytest_cache/
