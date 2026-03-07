@@ -723,7 +723,8 @@ def predict_cnv(
     )  # (N, 3)
 
     n = len(features)
-    vote_counts = np.zeros((n, NUM_CLASSES), dtype=np.float64)
+    vote_sums = np.zeros((n, NUM_CLASSES), dtype=np.float64)
+    vote_observations = np.zeros(n, dtype=np.float64)
 
     # -- Sliding window inference -------------------------------------------
     with torch.no_grad():
@@ -739,11 +740,13 @@ def predict_cnv(
             logits = model(x)  # (1, W, C)
             probs = F.softmax(logits[0], dim=-1).cpu().numpy()
             valid = end - pos
-            vote_counts[pos:end] += probs[:valid]
+            vote_sums[pos:end] += probs[:valid]
+            vote_observations[pos:end] += 1.0
             pos += stride
 
-    predictions = vote_counts.argmax(axis=1)
-    prediction_confidence = vote_counts.max(axis=1)
+    mean_probs = vote_sums / np.maximum(vote_observations[:, None], 1.0)
+    predictions = mean_probs.argmax(axis=1)
+    prediction_confidence = mean_probs.max(axis=1)
 
     # -- Collapse adjacent probes into CNV segments -------------------------
     segments: list[dict] = []
