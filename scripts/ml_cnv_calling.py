@@ -290,7 +290,7 @@ def assign_cn_labels(
                 skipped_regions += 1
                 continue
             class_label = SVTYPE_TO_CLASS[svtype]
-            overlap = (p_pos >= row["start"]) & (p_pos <= row["end"])
+            overlap = (p_pos >= row["start"]) & (p_pos < row["end"])
             n_overlap = int(overlap.sum())
             if n_overlap < min_probes:
                 skipped_regions += 1
@@ -422,6 +422,22 @@ def compute_class_weights(labels: np.ndarray) -> torch.Tensor:
     weights /= weights.sum()
     weights *= NUM_CLASSES
     return torch.tensor(weights, dtype=torch.float32)
+
+
+def compute_per_class_prf(
+    y_true: np.ndarray, y_pred: np.ndarray
+) -> Dict[int, Dict[str, float]]:
+    """Compute per-class precision/recall/F1 without external deps."""
+    metrics: Dict[int, Dict[str, float]] = {}
+    for cls in range(NUM_CLASSES):
+        tp = int(np.sum((y_true == cls) & (y_pred == cls)))
+        fp = int(np.sum((y_true != cls) & (y_pred == cls)))
+        fn = int(np.sum((y_true == cls) & (y_pred != cls)))
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+        f1 = 0.0 if (precision + recall) == 0 else 2 * precision * recall / (precision + recall)
+        metrics[cls] = {"precision": precision, "recall": recall, "f1": f1}
+    return metrics
 
 
 def train_model(
@@ -625,6 +641,8 @@ def train_model(
         val_loss = 0.0
         correct = 0
         total = 0
+        y_true_parts: list[np.ndarray] = []
+        y_pred_parts: list[np.ndarray] = []
         with torch.no_grad():
             for xb, yb in val_dl:
                 xb, yb = xb.to(device), yb.to(device)
@@ -636,17 +654,29 @@ def train_model(
                 preds = logits.argmax(dim=-1)
                 correct += (preds == yb).sum().item()
                 total += yb.numel()
+                y_true_parts.append(yb.cpu().reshape(-1).numpy())
+                y_pred_parts.append(preds.cpu().reshape(-1).numpy())
         val_loss /= max(len(val_ds), 1)
         val_acc = correct / max(total, 1)
+        y_true = np.concatenate(y_true_parts) if y_true_parts else np.array([], dtype=np.int64)
+        y_pred = np.concatenate(y_pred_parts) if y_pred_parts else np.array([], dtype=np.int64)
+        per_class = compute_per_class_prf(y_true, y_pred)
 
         scheduler.step(val_loss)
         LOG.info(
-            "Epoch %3d/%d  train_loss=%.4f  val_loss=%.4f  val_acc=%.4f",
+            "Epoch %3d/%d  train_loss=%.4f  val_loss=%.4f  val_acc=%.4f  "
+            "DEL(P/R/F1)=%.3f/%.3f/%.3f  DUP(P/R/F1)=%.3f/%.3f/%.3f",
             epoch,
             epochs,
             train_loss,
             val_loss,
             val_acc,
+            per_class[CLASS_DEL]["precision"],
+            per_class[CLASS_DEL]["recall"],
+            per_class[CLASS_DEL]["f1"],
+            per_class[CLASS_DUP]["precision"],
+            per_class[CLASS_DUP]["recall"],
+            per_class[CLASS_DUP]["f1"],
         )
 
         if val_loss < best_val_loss:
@@ -668,6 +698,7 @@ def predict_cnv(
     sample: Optional[str] = None,
     window: int = DEFAULT_WINDOW,
     stride: int = DEFAULT_STRIDE,
+    min_confidence: float = 0.5,
     device_name: str = "auto",
 ) -> None:
     """Run sliding-window inference and write a BED file of CNV calls."""
@@ -712,13 +743,14 @@ def predict_cnv(
             pos += stride
 
     predictions = vote_counts.argmax(axis=1)
+    prediction_confidence = vote_counts.max(axis=1)
 
     # -- Collapse adjacent probes into CNV segments -------------------------
     segments: list[dict] = []
     i = 0
     while i < n:
         cls = int(predictions[i])
-        if cls == CLASS_NORMAL:
+        if cls == CLASS_NORMAL or prediction_confidence[i] < min_confidence:
             i += 1
             continue
         chrom = probes.iloc[i]["chrom"]
@@ -728,6 +760,7 @@ def predict_cnv(
             j < n
             and int(predictions[j]) == cls
             and probes.iloc[j]["chrom"] == chrom
+            and prediction_confidence[j] >= min_confidence
         ):
             j += 1
         end = int(probes.iloc[j - 1]["pos"])
@@ -754,7 +787,7 @@ def predict_cnv(
     LOG.info(
         "Wrote %d CNV segments (%d non-diploid probes) to %s",
         len(seg_df),
-        int((predictions != CLASS_NORMAL).sum()),
+        int(((predictions != CLASS_NORMAL) & (prediction_confidence >= min_confidence)).sum()),
         output_path,
     )
 
@@ -859,6 +892,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--stride", type=int, default=DEFAULT_STRIDE, help="Window stride."
     )
     p_pred.add_argument(
+        "--min-confidence",
+        type=float,
+        default=0.5,
+        help="Minimum softmax confidence for non-normal probes to be included "
+        "in CNV segments (default: %(default)s).",
+    )
+    p_pred.add_argument(
         "--device",
         default="auto",
         help="Device (auto, cpu, cuda, cuda:0, …).",
@@ -899,6 +939,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             sample=args.sample,
             window=args.window,
             stride=args.stride,
+            min_confidence=args.min_confidence,
             device_name=args.device,
         )
 

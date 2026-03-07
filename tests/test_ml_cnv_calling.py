@@ -28,6 +28,7 @@ from ml_cnv_calling import (
     assign_cn_labels,
     build_parser,
     compute_class_weights,
+    compute_per_class_prf,
     compute_distance_channel,
 )
 
@@ -228,6 +229,21 @@ class TestAssignCnLabels:
         labels, stats = assign_cn_labels(probes, str(bed_path))
         assert all(l == CLASS_NORMAL for l in labels)
 
+    def test_bed_interval_is_half_open(self, tmp_path):
+        probes = pd.DataFrame(
+            {
+                "chrom": ["chr1"] * 5,
+                "pos": [1000, 2000, 3000, 4000, 5000],
+            }
+        )
+        bed_path = tmp_path / "truth_half_open.bed"
+        bed_path.write_text("chr1\t2000\t4000\tDEL\n")
+
+        labels, _ = assign_cn_labels(probes, str(bed_path))
+        assert labels[1] == CLASS_DEL  # start is included
+        assert labels[2] == CLASS_DEL
+        assert labels[3] == CLASS_NORMAL  # end is excluded
+
 
 class TestComputeClassWeights:
     """Tests for compute_class_weights()."""
@@ -254,6 +270,30 @@ class TestComputeClassWeights:
         assert weights.shape == (NUM_CLASSES,)
         # Class 2 has count=0 -> clipped to 1, gets highest weight
         assert weights[2] > weights[0]
+
+
+class TestComputePerClassPrf:
+    """Tests for compute_per_class_prf()."""
+
+    def test_balanced_predictions(self):
+        y_true = np.array([0, 1, 2, 0, 1, 2], dtype=np.int64)
+        y_pred = np.array([0, 1, 2, 0, 1, 2], dtype=np.int64)
+        metrics = compute_per_class_prf(y_true, y_pred)
+        for cls in (CLASS_DEL, CLASS_NORMAL, CLASS_DUP):
+            assert metrics[cls]["precision"] == pytest.approx(1.0)
+            assert metrics[cls]["recall"] == pytest.approx(1.0)
+            assert metrics[cls]["f1"] == pytest.approx(1.0)
+
+    def test_handles_missing_predictions(self):
+        y_true = np.array([0, 0, 1, 1, 2, 2], dtype=np.int64)
+        y_pred = np.array([1, 1, 1, 1, 1, 1], dtype=np.int64)
+        metrics = compute_per_class_prf(y_true, y_pred)
+        assert metrics[CLASS_DEL]["precision"] == pytest.approx(0.0)
+        assert metrics[CLASS_DEL]["recall"] == pytest.approx(0.0)
+        assert metrics[CLASS_DUP]["precision"] == pytest.approx(0.0)
+        assert metrics[CLASS_DUP]["recall"] == pytest.approx(0.0)
+        assert metrics[CLASS_NORMAL]["precision"] == pytest.approx(2 / 6)
+        assert metrics[CLASS_NORMAL]["recall"] == pytest.approx(1.0)
 
 
 # ===================================================================
@@ -345,6 +385,22 @@ class TestCLIParser:
         assert args.command == "predict"
         assert args.bcf == "test.bcf"
         assert args.model == "model.pt"
+        assert args.min_confidence == 0.5
+
+    def test_predict_command_min_confidence(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "predict",
+                "--bcf",
+                "test.bcf",
+                "--model",
+                "model.pt",
+                "--min-confidence",
+                "0.7",
+            ]
+        )
+        assert args.min_confidence == pytest.approx(0.7)
 
     def test_truth_bed_and_dir_mutually_exclusive(self):
         parser = build_parser()

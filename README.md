@@ -151,6 +151,7 @@ prevent data leakage.
 python scripts/ml_cnv_calling.py predict \
     --bcf sample.bcf \
     --model cnv_model.pt \
+    --min-confidence 0.5 \
     --output cnv_calls.bed
 ```
 
@@ -164,6 +165,10 @@ chr3    45000000   45800000   DUP    22
 ```
 
 Columns: `chrom  start  end  svtype  num_probes`
+
+`--min-confidence` sets a minimum per-probe softmax confidence for non-normal
+calls when building CNV segments, reducing low-confidence edge artifacts in
+predicted DEL/DUP regions.
 
 ## Data Sources & Citations
 
