@@ -200,45 +200,41 @@ metadata.
 ## HPC Usage with Apptainer
 
 Most HPC clusters do not permit Docker but support
-[Apptainer](https://apptainer.org/) (the successor to Singularity).  An
-`Apptainer.def` definition file is provided so you can build a portable SIF
-image that bundles the model code, Python dependencies, and the bundled truth
-set VCF.
+[Apptainer](https://apptainer.org/) (the successor to Singularity).  A
+pre-built container image is available from GitHub Container Registry.  All
+scripts, Python dependencies, and the bundled truth-set VCF are pre-packed
+in the image — no local installation required.
 
-### Building the SIF image
+### Pulling the image
 
 ```bash
-apptainer build array_cnv_caller.sif Apptainer.def
+apptainer pull docker://ghcr.io/jlanej/array_cnv_caller:main
 ```
 
 ### Batteries-included training pipeline
 
-`scripts/run_pipeline.sh` orchestrates the complete workflow – truth-set
-preparation, multi-sample training, and (optionally) prediction – in a single
-command.  It targets the ~2,141-sample 1000 Genomes BCF produced by
+Run the full training workflow directly via Apptainer.  The pipeline
+orchestrates truth-set preparation, multi-sample training, and (optionally)
+prediction in a single command, targeting the ~2,141-sample 1000 Genomes BCF
+produced by
 [`process_1000g.sh`](https://github.com/jlanej/illumina_idat_processing/blob/main/scripts/process_1000g.sh)
-and the shapeit5-phased truth set bundled in the container.
+and the shapeit5-phased truth set bundled in the image.
 
 ```bash
-# Full training pipeline via Apptainer
-bash scripts/run_pipeline.sh \
-    --bcf /path/to/1000g_multisample.bcf \
-    --sif array_cnv_caller.sif \
-    --outdir pipeline_output \
+# Full training pipeline
+apptainer exec --nv --bind $PWD array_cnv_caller_main.sif \
+    bash /app/scripts/run_pipeline.sh \
+    --bcf $PWD/1000g_multisample.bcf \
+    --outdir $PWD/pipeline_output \
     --epochs 30 \
-    --min-probes 5 \
-    --device auto
+    --min-probes 5
 
 # With prediction on every sample after training
-bash scripts/run_pipeline.sh \
-    --bcf /path/to/1000g_multisample.bcf \
-    --sif array_cnv_caller.sif \
+apptainer exec --nv --bind $PWD array_cnv_caller_main.sif \
+    bash /app/scripts/run_pipeline.sh \
+    --bcf $PWD/1000g_multisample.bcf \
+    --outdir $PWD/pipeline_output \
     --predict
-
-# Native execution (no container)
-bash scripts/run_pipeline.sh \
-    --bcf /path/to/1000g_multisample.bcf \
-    --native
 ```
 
 The pipeline:
@@ -255,8 +251,6 @@ Pipeline options:
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--bcf` | *(required)* | Multi-sample BCF with FORMAT/LRR and FORMAT/BAF |
-| `--sif` | — | Apptainer SIF image (use `--native` instead for bare-metal) |
-| `--native` | — | Run without a container |
 | `--truth-vcf` | bundled | Override the default shapeit5-phased VCF |
 | `--outdir` | `pipeline_output` | Output directory |
 | `--epochs` | 30 | Training epochs |
@@ -265,40 +259,38 @@ Pipeline options:
 | `--min-probes` | 5 | Min array probes per truth region |
 | `--device` | `auto` | `auto`, `cpu`, `cuda`, `cuda:0`, … |
 | `--predict` | off | Also run prediction after training |
-| `--bind` | — | Extra Apptainer bind mounts (e.g. `/scratch:/scratch`) |
 
-### Running individual steps with Apptainer
+### Running individual steps
+
+Each step can also be called independently via Apptainer:
 
 ```bash
-# Prepare truth sets
-apptainer run array_cnv_caller.sif \
-    scripts/prepare_truth_set.py \
-    --vcf resources/shapeit5-phased-callset_final-vcf.phased.vcf.gz \
-    --output-dir truth_sets
+SIF=array_cnv_caller_main.sif
 
-# Train (bind-mount your data directory)
-apptainer run --nv \
-    --bind /data:/data \
-    array_cnv_caller.sif \
-    scripts/ml_cnv_calling.py train \
-    --bcf /data/1000g_multisample.bcf \
-    --truth-dir truth_sets/per_sample/ \
+# Prepare truth sets
+apptainer exec --bind $PWD $SIF \
+    python /app/scripts/prepare_truth_set.py \
+    --vcf /app/resources/shapeit5-phased-callset_final-vcf.phased.vcf.gz \
+    --output-dir $PWD/truth_sets
+
+# Train (multi-sample)
+apptainer exec --nv --bind $PWD $SIF \
+    python /app/scripts/ml_cnv_calling.py train \
+    --bcf $PWD/1000g_multisample.bcf \
+    --truth-dir $PWD/truth_sets/per_sample/ \
     --min-probes 5 \
-    --overlap-report overlap.tsv \
-    --output cnv_model.pt
+    --overlap-report $PWD/overlap.tsv \
+    --output $PWD/cnv_model.pt
 
 # Predict
-apptainer run --nv \
-    --bind /data:/data \
-    array_cnv_caller.sif \
-    scripts/ml_cnv_calling.py predict \
-    --bcf /data/sample.bcf \
-    --model cnv_model.pt \
-    --output cnv_calls.bed
+apptainer exec --nv --bind $PWD $SIF \
+    python /app/scripts/ml_cnv_calling.py predict \
+    --bcf $PWD/sample.bcf \
+    --model $PWD/cnv_model.pt \
+    --output $PWD/cnv_calls.bed
 ```
 
-> **GPU support:** Pass `--nv` to `apptainer run` for NVIDIA GPU passthrough.
-> The pipeline script does this automatically when `--device` is not `cpu`.
+> **GPU support:** Pass `--nv` to `apptainer exec` for NVIDIA GPU passthrough.
 
 ### Example SLURM job script
 
@@ -314,30 +306,30 @@ apptainer run --nv \
 
 module load apptainer   # or: module load singularity
 
-bash scripts/run_pipeline.sh \
+SIF="$HOME/containers/array_cnv_caller_main.sif"
+
+apptainer exec --nv --bind /scratch:/scratch "$SIF" \
+    bash /app/scripts/run_pipeline.sh \
     --bcf /scratch/$USER/1000g_multisample.bcf \
-    --sif array_cnv_caller.sif \
     --outdir /scratch/$USER/cnv_output \
     --epochs 30 \
     --min-probes 5 \
-    --device auto \
-    --predict \
-    --bind /scratch:/scratch
+    --predict
 ```
 
 ## Docker
 
 A Docker image containing all dependencies is published automatically via
-GitHub Actions. To build locally:
+GitHub Actions to `ghcr.io/jlanej/array_cnv_caller`.  To build locally:
 
 ```bash
 docker build -t array_cnv_caller .
 ```
 
-The Docker image can also be converted to an Apptainer SIF for HPC use:
+For HPC use, pull the published image as an Apptainer SIF (see above):
 
 ```bash
-apptainer build array_cnv_caller.sif docker-daemon://array_cnv_caller:latest
+apptainer pull docker://ghcr.io/jlanej/array_cnv_caller:main
 ```
 
 ## Testing
