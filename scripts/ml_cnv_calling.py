@@ -65,6 +65,7 @@ NUM_CLASSES = 3  # DEL=0, NORMAL=1, DUP=2
 CLASS_DEL = 0
 CLASS_NORMAL = 1
 CLASS_DUP = 2
+IGNORE_INDEX = -1  # probes excluded from loss (filtered SVs with ambiguous copy number)
 CLASS_NAMES = {CLASS_DEL: "DEL", CLASS_NORMAL: "NORMAL", CLASS_DUP: "DUP"}
 SVTYPE_TO_CLASS = {"DEL": CLASS_DEL, "DUP": CLASS_DUP}
 INPUT_CHANNELS = 3  # LRR, BAF, distance
@@ -312,15 +313,22 @@ def assign_cn_labels(
 
     Probes overlapping a truth region inherit its class (DEL=0 or DUP=2);
     all others are labelled NORMAL (class 1).  Truth regions overlapping
-    fewer than *min_probes* array probes are excluded from labelling.
+    fewer than *min_probes* array probes are excluded from labelling and
+    their probes are marked with ``IGNORE_INDEX`` (-1) so they are masked
+    out of the loss calculation entirely.  This avoids teaching the model
+    that ambiguous (possibly-variant but unconfirmable) probes are NORMAL.
+    A used (larger) SV always overrides the ignore mark.
 
     Returns
     -------
     labels : np.ndarray
-        Per-probe class labels (int64): 0=DEL, 1=NORMAL, 2=DUP.
+        Per-probe class labels (int64): 0=DEL, 1=NORMAL, 2=DUP,
+        or ``IGNORE_INDEX`` (-1) for probes that should be excluded from
+        the training loss.
     stats : dict
         ``total_regions``, ``used_regions``, ``skipped_regions``,
-        ``probes_labeled`` (count of non-NORMAL probes).
+        ``probes_labeled`` (count of DEL/DUP probes),
+        ``probes_masked`` (count of IGNORE_INDEX probes).
     """
     truth = pd.read_csv(
         truth_bed,
@@ -330,6 +338,8 @@ def assign_cn_labels(
         dtype={"chrom": str, "start": int, "end": int, "svtype": str},
     )
     labels = np.full(len(probes), CLASS_NORMAL, dtype=np.int64)
+    # Track probes touched by filtered SVs; used SVs will override this.
+    possibly_variant = np.zeros(len(probes), dtype=bool)
 
     total_regions = 0
     used_regions = 0
@@ -352,15 +362,27 @@ def assign_cn_labels(
             n_overlap = int(overlap.sum())
             if n_overlap < min_probes:
                 skipped_regions += 1
+                # Mark as possibly variant so these probes are excluded from
+                # the loss rather than incorrectly labelled NORMAL.
+                possibly_variant[p_idx[overlap]] = True
                 continue
             used_regions += 1
             labels[p_idx[overlap]] = class_label
+            # A confirmed SV overrides any earlier possibly-variant mark.
+            possibly_variant[p_idx[overlap]] = False
+
+    # Probes covered only by filtered SVs are masked out of the loss.
+    mask_idx = possibly_variant & (labels == CLASS_NORMAL)
+    labels[mask_idx] = IGNORE_INDEX
 
     stats = {
         "total_regions": total_regions,
         "used_regions": used_regions,
         "skipped_regions": skipped_regions,
-        "probes_labeled": int((labels != CLASS_NORMAL).sum()),
+        "probes_labeled": int(
+            ((labels != CLASS_NORMAL) & (labels != IGNORE_INDEX)).sum()
+        ),
+        "probes_masked": int((labels == IGNORE_INDEX).sum()),
     }
     return labels, stats
 
@@ -473,8 +495,12 @@ class ProbeDataset(Dataset):
 # Training
 # ===================================================================
 def compute_class_weights(labels: np.ndarray) -> torch.Tensor:
-    """Inverse-frequency class weights for weighted cross-entropy."""
-    counts = np.bincount(labels, minlength=NUM_CLASSES).astype(np.float64)
+    """Inverse-frequency class weights for weighted cross-entropy.
+
+    ``IGNORE_INDEX`` probes are excluded before computing frequencies.
+    """
+    valid = labels[labels != IGNORE_INDEX]
+    counts = np.bincount(valid, minlength=NUM_CLASSES).astype(np.float64)
     counts = np.clip(counts, 1, None)  # avoid division by zero
     weights = 1.0 / counts
     weights /= weights.sum()
@@ -581,12 +607,14 @@ def train_model(
             all_features.append(features)
             all_labels.append(labels)
             LOG.info(
-                "  %s: %d probes, %d/%d truth regions used, %d probes labeled",
+                "  %s: %d probes, %d/%d truth regions used, "
+                "%d probes labeled, %d masked",
                 s,
                 len(probes),
                 stats["used_regions"],
                 stats["total_regions"],
                 stats["probes_labeled"],
+                stats["probes_masked"],
             )
 
         if not all_features:
@@ -645,10 +673,12 @@ def train_model(
             "Loaded %d probes – class distribution: %s", len(probes), class_dist
         )
         LOG.info(
-            "Truth regions: %d used, %d skipped (min_probes=%d)",
+            "Truth regions: %d used, %d skipped (min_probes=%d), "
+            "%d probes masked",
             stats["used_regions"],
             stats["skipped_regions"],
             min_probes,
+            stats["probes_masked"],
         )
 
         n = len(features)
@@ -672,7 +702,7 @@ def train_model(
     # -- Model & optimiser --------------------------------------------------
     model = CNVSegmenter(use_crf=use_crf).to(device)
     class_weights = compute_class_weights(all_train_labels).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, ignore_index=IGNORE_INDEX)
     optimiser = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimiser, mode="min", factor=0.5, patience=3
@@ -689,7 +719,14 @@ def train_model(
             xb, yb = xb.to(device), yb.to(device)
             logits = model(xb)  # (B, W, C)
             if use_crf:
-                loss = model.crf_loss(logits, yb)
+                mask = yb != IGNORE_INDEX
+                if not mask.any():
+                    continue
+                # torchcrf requires non-negative tag indices.  Replace
+                # IGNORE_INDEX with CLASS_NORMAL as a harmless placeholder;
+                # these positions are fully excluded by the boolean mask.
+                tags = yb.masked_fill(~mask, CLASS_NORMAL)
+                loss = model.crf_loss(logits, tags, mask=mask)
             else:
                 loss = criterion(logits.reshape(-1, NUM_CLASSES), yb.reshape(-1))
             optimiser.zero_grad()
@@ -710,20 +747,37 @@ def train_model(
                 xb, yb = xb.to(device), yb.to(device)
                 logits = model(xb)
                 if use_crf:
-                    loss = model.crf_loss(logits, yb)
-                    decoded = model.crf_decode(logits)
+                    mask = yb != IGNORE_INDEX
+                    if not mask.any():
+                        continue
+                    tags = yb.masked_fill(~mask, CLASS_NORMAL)
+                    loss = model.crf_loss(logits, tags, mask=mask)
+                    decoded = model.crf_decode(logits, mask=mask)
+                    # Pad decoded sequences back to full window length so
+                    # shapes align for masking below.  Padding with
+                    # IGNORE_INDEX makes it explicit these positions are
+                    # excluded from metrics by valid_mask.
+                    pad_decoded = [
+                        seq + [IGNORE_INDEX] * (yb.shape[1] - len(seq))
+                        for seq in decoded
+                    ]
                     preds = torch.as_tensor(
-                        np.array(decoded), dtype=torch.long, device=device,
+                        np.array(pad_decoded), dtype=torch.long, device=device,
                     )
                 else:
                     loss = criterion(
                         logits.reshape(-1, NUM_CLASSES), yb.reshape(-1)
                     )
                     preds = logits.argmax(dim=-1)
-                correct += (preds == yb).sum().item()
-                total += yb.numel()
-                y_true_parts.append(yb.cpu().reshape(-1).numpy())
-                y_pred_parts.append(preds.cpu().reshape(-1).numpy())
+                val_loss += loss.item() * xb.size(0)
+                # Exclude IGNORE_INDEX probes from accuracy and PRF metrics.
+                valid_mask = (yb != IGNORE_INDEX).reshape(-1)
+                y_true_flat = yb.reshape(-1)[valid_mask].cpu().numpy()
+                y_pred_flat = preds.reshape(-1)[valid_mask].cpu().numpy()
+                correct += int((y_true_flat == y_pred_flat).sum())
+                total += int(valid_mask.sum())
+                y_true_parts.append(y_true_flat)
+                y_pred_parts.append(y_pred_flat)
         val_loss /= max(len(val_ds), 1)
         val_acc = correct / max(total, 1)
         y_true = np.concatenate(y_true_parts) if y_true_parts else np.array([], dtype=np.int64)

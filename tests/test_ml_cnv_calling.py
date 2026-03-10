@@ -22,6 +22,7 @@ from ml_cnv_calling import (
     CNVSegmenter,
     DEFAULT_STRIDE,
     DEFAULT_WINDOW,
+    IGNORE_INDEX,
     INPUT_CHANNELS,
     NUM_CLASSES,
     ProbeDataset,
@@ -303,10 +304,15 @@ class TestAssignCnLabels:
         # Region only overlaps 1 probe (pos=2000)
         bed_path.write_text("chr1\t1500\t2500\tDEL\n")
 
-        # With min_probes=2, this region should be skipped
+        # With min_probes=2, the SV is filtered; its probe should be
+        # masked (IGNORE_INDEX) rather than forced to NORMAL.
         labels, stats = assign_cn_labels(probes, str(bed_path), min_probes=2)
-        assert all(l == CLASS_NORMAL for l in labels)
+        assert labels[1] == IGNORE_INDEX  # pos=2000 covered by filtered SV
         assert stats["skipped_regions"] == 1
+        assert stats["probes_masked"] == 1
+        # Other probes remain NORMAL
+        assert labels[0] == CLASS_NORMAL
+        assert labels[2] == CLASS_NORMAL
 
     def test_stats_output(self, tmp_path):
         probes = pd.DataFrame(
@@ -353,7 +359,7 @@ class TestAssignCnLabels:
         assert labels[3] == CLASS_NORMAL  # end is excluded
 
     def test_min_probes_filter_multiple_thresholds(self, tmp_path):
-        """SVs spanning fewer than N probes should be skipped at various N."""
+        """SVs spanning fewer than N probes should be masked at various N."""
         probes = pd.DataFrame(
             {
                 "chrom": ["chr1"] * 10,
@@ -370,22 +376,31 @@ class TestAssignCnLabels:
         )
         assert stats_3["used_regions"] == 1
         assert stats_3["skipped_regions"] == 0
+        assert stats_3["probes_masked"] == 0
         assert (labels_3 == CLASS_DEL).sum() == 3
 
-        # min_probes=4 → region skipped (only 3 probes overlap)
+        # min_probes=4 → SV filtered; its 3 probes become IGNORE_INDEX
         labels_4, stats_4 = assign_cn_labels(
             probes, str(bed_path), min_probes=4
         )
         assert stats_4["used_regions"] == 0
         assert stats_4["skipped_regions"] == 1
-        assert all(l == CLASS_NORMAL for l in labels_4)
+        assert stats_4["probes_masked"] == 3
+        assert labels_4[2] == IGNORE_INDEX  # pos=3000
+        assert labels_4[3] == IGNORE_INDEX  # pos=4000
+        assert labels_4[4] == IGNORE_INDEX  # pos=5000
+        # Probes outside the filtered SV remain NORMAL
+        assert labels_4[0] == CLASS_NORMAL
+        assert labels_4[9] == CLASS_NORMAL
 
-        # min_probes=5 → region skipped
+        # min_probes=5 → same outcome
         labels_5, stats_5 = assign_cn_labels(
             probes, str(bed_path), min_probes=5
         )
-        assert stats_5["skipped_regions"] == 1
-        assert all(l == CLASS_NORMAL for l in labels_5)
+        assert stats_5["probes_masked"] == 3
+        assert all(
+            labels_5[i] == IGNORE_INDEX for i in [2, 3, 4]
+        )
 
     def test_min_probes_mixed_regions(self, tmp_path):
         """With multiple regions, only those meeting the threshold are used."""
@@ -396,8 +411,8 @@ class TestAssignCnLabels:
             }
         )
         bed_path = tmp_path / "truth.bed"
-        # Region A: overlaps 1 probe (pos=2000)
-        # Region B: overlaps 5 probes (pos=5000..9000)
+        # Region A: overlaps 1 probe (pos=2000) → filtered, masked
+        # Region B: overlaps 5 probes (pos=5000..9000) → used
         bed_path.write_text(
             "chr1\t1500\t2500\tDEL\n"
             "chr1\t4500\t9500\tDUP\n"
@@ -407,13 +422,41 @@ class TestAssignCnLabels:
             probes, str(bed_path), min_probes=3
         )
         assert stats["total_regions"] == 2
-        assert stats["used_regions"] == 1   # only region B
+        assert stats["used_regions"] == 1    # only region B
         assert stats["skipped_regions"] == 1  # region A skipped
-        # Region A probe should remain NORMAL
-        assert labels[1] == CLASS_NORMAL  # pos=2000
+        # Region A's probe is masked (possibly variant but unconfirmable)
+        assert labels[1] == IGNORE_INDEX  # pos=2000
         # Region B probes should be DUP
         assert labels[4] == CLASS_DUP  # pos=5000
         assert labels[8] == CLASS_DUP  # pos=9000
+        assert stats["probes_masked"] == 1
+
+    def test_confirmed_sv_overrides_mask(self, tmp_path):
+        """A confirmed (large) SV that overlaps a masked probe should label it."""
+        probes = pd.DataFrame(
+            {
+                "chrom": ["chr1"] * 5,
+                "pos": [1000, 2000, 3000, 4000, 5000],
+            }
+        )
+        bed_path = tmp_path / "truth.bed"
+        # Small DEL (1 probe, pos=2000) – filtered
+        # Large DUP that also covers pos=2000 – confirmed
+        bed_path.write_text(
+            "chr1\t1500\t2500\tDEL\n"
+            "chr1\t1500\t4500\tDUP\n"
+        )
+
+        labels, stats = assign_cn_labels(
+            probes, str(bed_path), min_probes=2
+        )
+        # Small DEL skipped; large DUP used (covers pos=2000, 3000, 4000)
+        assert stats["used_regions"] == 1
+        assert stats["skipped_regions"] == 1
+        # pos=2000 should be DUP (confirmed by the large SV), not IGNORE
+        assert labels[1] == CLASS_DUP
+        assert labels[2] == CLASS_DUP
+        assert stats["probes_masked"] == 0
 
 
 class TestComputeClassWeights:
@@ -441,6 +484,14 @@ class TestComputeClassWeights:
         assert weights.shape == (NUM_CLASSES,)
         # Class 2 has count=0 -> clipped to 1, gets highest weight
         assert weights[2] > weights[0]
+
+    def test_ignores_masked_probes(self):
+        """IGNORE_INDEX probes must not affect class weight computation."""
+        labels_with = np.array([0, IGNORE_INDEX, 1, IGNORE_INDEX, 2])
+        labels_without = np.array([0, 1, 2])
+        weights_with = compute_class_weights(labels_with)
+        weights_without = compute_class_weights(labels_without)
+        assert torch.allclose(weights_with, weights_without, atol=1e-5)
 
 
 class TestComputePerClassPrf:
@@ -631,6 +682,7 @@ class TestConstants:
         assert CLASS_DEL == 0
         assert CLASS_NORMAL == 1
         assert CLASS_DUP == 2
+        assert IGNORE_INDEX == -1  # must be negative (CrossEntropyLoss ignore_index)
 
     def test_input_channels(self):
         assert INPUT_CHANNELS == 3  # LRR, BAF, distance
