@@ -99,6 +99,114 @@ class TestCNVSegmenter:
 
 
 # ===================================================================
+# CRF integration tests
+# ===================================================================
+class TestCNVSegmenterCRF:
+    """Tests for the CRF-enabled CNN + Bi-LSTM model."""
+
+    def test_crf_output_shape(self):
+        """CRF model should produce the same emission shape as the base model."""
+        model = CNVSegmenter(use_crf=True)
+        x = torch.randn(2, INPUT_CHANNELS, 64)
+        out = model(x)
+        assert out.shape == (2, 64, NUM_CLASSES)
+
+    def test_crf_flag_stored(self):
+        """The use_crf flag should be accessible on the model."""
+        model_crf = CNVSegmenter(use_crf=True)
+        model_no = CNVSegmenter(use_crf=False)
+        assert model_crf.use_crf is True
+        assert model_no.use_crf is False
+
+    def test_crf_layer_exists(self):
+        """When use_crf=True, the model must have a CRF sub-module."""
+        model = CNVSegmenter(use_crf=True)
+        assert hasattr(model, "crf")
+        # CRF transition matrix should be (num_classes, num_classes)
+        assert model.crf.transitions.shape == (NUM_CLASSES, NUM_CLASSES)
+
+    def test_no_crf_layer_when_disabled(self):
+        """When use_crf=False, no CRF sub-module should exist."""
+        model = CNVSegmenter(use_crf=False)
+        assert not hasattr(model, "crf")
+
+    def test_crf_loss_scalar(self):
+        """crf_loss should return a scalar tensor with grad."""
+        model = CNVSegmenter(use_crf=True)
+        x = torch.randn(2, INPUT_CHANNELS, 64)
+        emissions = model(x)
+        tags = torch.randint(0, NUM_CLASSES, (2, 64))
+        loss = model.crf_loss(emissions, tags)
+        assert loss.dim() == 0  # scalar
+        assert loss.requires_grad
+
+    def test_crf_decode_output(self):
+        """crf_decode should return a list of lists with valid class ids."""
+        model = CNVSegmenter(use_crf=True)
+        model.eval()
+        x = torch.randn(3, INPUT_CHANNELS, 32)
+        with torch.no_grad():
+            emissions = model(x)
+            decoded = model.crf_decode(emissions)
+        assert len(decoded) == 3
+        for seq in decoded:
+            assert len(seq) == 32
+            assert all(0 <= tag < NUM_CLASSES for tag in seq)
+
+    def test_crf_decode_with_mask(self):
+        """crf_decode should respect a boolean mask."""
+        model = CNVSegmenter(use_crf=True)
+        model.eval()
+        x = torch.randn(1, INPUT_CHANNELS, 16)
+        mask = torch.zeros(1, 16, dtype=torch.bool)
+        mask[0, :10] = True  # only first 10 positions valid
+        with torch.no_grad():
+            emissions = model(x)
+            decoded = model.crf_decode(emissions, mask=mask)
+        assert len(decoded[0]) == 10
+
+    def test_crf_transition_matrix_updated(self):
+        """CRF transition parameters must receive gradient updates."""
+        model = CNVSegmenter(use_crf=True)
+        x = torch.randn(2, INPUT_CHANNELS, 64)
+        tags = torch.randint(0, NUM_CLASSES, (2, 64))
+
+        transitions_before = model.crf.transitions.data.clone()
+        emissions = model(x)
+        loss = model.crf_loss(emissions, tags)
+        loss.backward()
+
+        # Verify transitions received non-zero gradients
+        assert model.crf.transitions.grad is not None
+        assert model.crf.transitions.grad.abs().sum() > 0
+
+        # Simulate an optimiser step
+        with torch.no_grad():
+            model.crf.transitions -= 0.1 * model.crf.transitions.grad
+        assert not torch.equal(model.crf.transitions.data, transitions_before)
+
+    def test_crf_gradient_flow_through_full_model(self):
+        """Gradients should flow from CRF loss through LSTM and CNN."""
+        model = CNVSegmenter(use_crf=True)
+        x = torch.randn(2, INPUT_CHANNELS, 64, requires_grad=True)
+        emissions = model(x)
+        tags = torch.randint(0, NUM_CLASSES, (2, 64))
+        loss = model.crf_loss(emissions, tags)
+        loss.backward()
+        assert x.grad is not None
+        assert x.grad.abs().sum() > 0
+
+    def test_crf_parameter_count_increase(self):
+        """CRF model should have more parameters than the base model."""
+        model_base = CNVSegmenter(use_crf=False)
+        model_crf = CNVSegmenter(use_crf=True)
+        n_base = sum(p.numel() for p in model_base.parameters())
+        n_crf = sum(p.numel() for p in model_crf.parameters())
+        # CRF adds transitions (C*C) + start_transitions (C) + end_transitions (C)
+        assert n_crf > n_base
+
+
+# ===================================================================
 # Data helper tests
 # ===================================================================
 class TestComputeDistanceChannel:
@@ -243,6 +351,69 @@ class TestAssignCnLabels:
         assert labels[1] == CLASS_DEL  # start is included
         assert labels[2] == CLASS_DEL
         assert labels[3] == CLASS_NORMAL  # end is excluded
+
+    def test_min_probes_filter_multiple_thresholds(self, tmp_path):
+        """SVs spanning fewer than N probes should be skipped at various N."""
+        probes = pd.DataFrame(
+            {
+                "chrom": ["chr1"] * 10,
+                "pos": list(range(1000, 11000, 1000)),
+            }
+        )
+        bed_path = tmp_path / "truth.bed"
+        # Region overlaps 3 probes (pos=3000, 4000, 5000 in [2500,5500))
+        bed_path.write_text("chr1\t2500\t5500\tDEL\n")
+
+        # min_probes=3 → region kept (exactly 3 overlapping probes)
+        labels_3, stats_3 = assign_cn_labels(
+            probes, str(bed_path), min_probes=3
+        )
+        assert stats_3["used_regions"] == 1
+        assert stats_3["skipped_regions"] == 0
+        assert (labels_3 == CLASS_DEL).sum() == 3
+
+        # min_probes=4 → region skipped (only 3 probes overlap)
+        labels_4, stats_4 = assign_cn_labels(
+            probes, str(bed_path), min_probes=4
+        )
+        assert stats_4["used_regions"] == 0
+        assert stats_4["skipped_regions"] == 1
+        assert all(l == CLASS_NORMAL for l in labels_4)
+
+        # min_probes=5 → region skipped
+        labels_5, stats_5 = assign_cn_labels(
+            probes, str(bed_path), min_probes=5
+        )
+        assert stats_5["skipped_regions"] == 1
+        assert all(l == CLASS_NORMAL for l in labels_5)
+
+    def test_min_probes_mixed_regions(self, tmp_path):
+        """With multiple regions, only those meeting the threshold are used."""
+        probes = pd.DataFrame(
+            {
+                "chrom": ["chr1"] * 10,
+                "pos": list(range(1000, 11000, 1000)),
+            }
+        )
+        bed_path = tmp_path / "truth.bed"
+        # Region A: overlaps 1 probe (pos=2000)
+        # Region B: overlaps 5 probes (pos=5000..9000)
+        bed_path.write_text(
+            "chr1\t1500\t2500\tDEL\n"
+            "chr1\t4500\t9500\tDUP\n"
+        )
+
+        labels, stats = assign_cn_labels(
+            probes, str(bed_path), min_probes=3
+        )
+        assert stats["total_regions"] == 2
+        assert stats["used_regions"] == 1   # only region B
+        assert stats["skipped_regions"] == 1  # region A skipped
+        # Region A probe should remain NORMAL
+        assert labels[1] == CLASS_NORMAL  # pos=2000
+        # Region B probes should be DUP
+        assert labels[4] == CLASS_DUP  # pos=5000
+        assert labels[8] == CLASS_DUP  # pos=9000
 
 
 class TestComputeClassWeights:
@@ -429,6 +600,21 @@ class TestCLIParser:
         assert args.stride == 256
         assert args.device == "auto"
         assert args.output == "cnv_model.pt"
+        assert args.use_crf is False
+
+    def test_train_use_crf(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            ["train", "--bcf", "test.bcf", "--truth-bed", "truth.bed", "--use-crf"]
+        )
+        assert args.use_crf is True
+
+    def test_predict_use_crf(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            ["predict", "--bcf", "test.bcf", "--model", "model.pt", "--use-crf"]
+        )
+        assert args.use_crf is True
 
 
 # ===================================================================

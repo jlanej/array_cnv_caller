@@ -56,6 +56,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
+from torchcrf import CRF
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -99,6 +100,11 @@ class CNVSegmenter(nn.Module):
         Number of output classes (DEL, NORMAL, DUP).
     dropout : float
         Dropout probability applied between CNN and LSTM layers.
+    use_crf : bool
+        When *True* a CRF layer is appended after the fully-connected head.
+        During training the loss is the negative log-likelihood computed by
+        the CRF; during inference the Viterbi algorithm is used to decode
+        the most likely sequence of states.
     """
 
     def __init__(
@@ -110,8 +116,10 @@ class CNVSegmenter(nn.Module):
         lstm_layers: int = 2,
         num_classes: int = NUM_CLASSES,
         dropout: float = 0.2,
+        use_crf: bool = False,
     ) -> None:
         super().__init__()
+        self.use_crf = use_crf
 
         # -- 1-D CNN stack (causal-ish, same-length padding) ----------------
         layers: list[nn.Module] = []
@@ -141,8 +149,12 @@ class CNVSegmenter(nn.Module):
         # -- Fully-connected head -------------------------------------------
         self.fc = nn.Linear(lstm_hidden * 2, num_classes)
 
+        # -- Optional CRF layer --------------------------------------------
+        if use_crf:
+            self.crf = CRF(num_classes, batch_first=True)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
+        """Forward pass – returns emission logits.
 
         Parameters
         ----------
@@ -152,7 +164,8 @@ class CNVSegmenter(nn.Module):
         Returns
         -------
         Tensor
-            Shape ``(batch, seq_len, num_classes)`` – logits per probe.
+            Shape ``(batch, seq_len, num_classes)`` – logits (emissions)
+            per probe.
         """
         # CNN: (B, C, L) -> (B, cnn_ch, L)
         h = self.cnn(x)
@@ -162,6 +175,51 @@ class CNVSegmenter(nn.Module):
         h, _ = self.lstm(h)
         # FC: (B, L, num_classes)
         return self.fc(h)
+
+    # -- CRF helpers --------------------------------------------------------
+
+    def crf_loss(
+        self, emissions: torch.Tensor, tags: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute the CRF negative log-likelihood loss.
+
+        Parameters
+        ----------
+        emissions : Tensor
+            Shape ``(batch, seq_len, num_classes)`` – output of ``forward()``.
+        tags : Tensor
+            Shape ``(batch, seq_len)`` – ground-truth class indices.
+        mask : Tensor, optional
+            Boolean mask of shape ``(batch, seq_len)``.
+
+        Returns
+        -------
+        Tensor
+            Scalar loss (negated log-likelihood).
+        """
+        # torchcrf.CRF.forward returns log-likelihood; negate for loss
+        return -self.crf(emissions, tags, mask=mask)
+
+    def crf_decode(
+        self, emissions: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> List[List[int]]:
+        """Viterbi-decode the most likely tag sequence.
+
+        Parameters
+        ----------
+        emissions : Tensor
+            Shape ``(batch, seq_len, num_classes)``.
+        mask : Tensor, optional
+            Boolean mask of shape ``(batch, seq_len)``.
+
+        Returns
+        -------
+        list[list[int]]
+            Best tag sequence for each item in the batch.
+        """
+        return self.crf.decode(emissions, mask=mask)
 
 
 # ===================================================================
@@ -454,6 +512,7 @@ def train_model(
     lr: float = DEFAULT_LR,
     batch_size: int = DEFAULT_BATCH,
     device_name: str = "auto",
+    use_crf: bool = False,
 ) -> None:
     """End-to-end training loop.
 
@@ -611,7 +670,7 @@ def train_model(
     )
 
     # -- Model & optimiser --------------------------------------------------
-    model = CNVSegmenter().to(device)
+    model = CNVSegmenter(use_crf=use_crf).to(device)
     class_weights = compute_class_weights(all_train_labels).to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimiser = torch.optim.Adam(model.parameters(), lr=lr)
@@ -629,7 +688,10 @@ def train_model(
         for xb, yb in train_dl:
             xb, yb = xb.to(device), yb.to(device)
             logits = model(xb)  # (B, W, C)
-            loss = criterion(logits.reshape(-1, NUM_CLASSES), yb.reshape(-1))
+            if use_crf:
+                loss = model.crf_loss(logits, yb)
+            else:
+                loss = criterion(logits.reshape(-1, NUM_CLASSES), yb.reshape(-1))
             optimiser.zero_grad()
             loss.backward()
             optimiser.step()
@@ -647,11 +709,17 @@ def train_model(
             for xb, yb in val_dl:
                 xb, yb = xb.to(device), yb.to(device)
                 logits = model(xb)
-                loss = criterion(
-                    logits.reshape(-1, NUM_CLASSES), yb.reshape(-1)
-                )
-                val_loss += loss.item() * xb.size(0)
-                preds = logits.argmax(dim=-1)
+                if use_crf:
+                    loss = model.crf_loss(logits, yb)
+                    decoded = model.crf_decode(logits)
+                    preds = torch.tensor(
+                        decoded, dtype=torch.long, device=device,
+                    )
+                else:
+                    loss = criterion(
+                        logits.reshape(-1, NUM_CLASSES), yb.reshape(-1)
+                    )
+                    preds = logits.argmax(dim=-1)
                 correct += (preds == yb).sum().item()
                 total += yb.numel()
                 y_true_parts.append(yb.cpu().reshape(-1).numpy())
@@ -700,6 +768,7 @@ def predict_cnv(
     stride: int = DEFAULT_STRIDE,
     min_confidence: float = 0.5,
     device_name: str = "auto",
+    use_crf: bool = False,
 ) -> None:
     """Run sliding-window inference and write a BED file of CNV calls."""
 
@@ -709,7 +778,7 @@ def predict_cnv(
         device = torch.device(device_name)
 
     # -- Load model ---------------------------------------------------------
-    model = CNVSegmenter().to(device)
+    model = CNVSegmenter(use_crf=use_crf).to(device)
     model.load_state_dict(
         torch.load(model_path, map_location=device, weights_only=True)
     )
@@ -732,16 +801,28 @@ def predict_cnv(
         while pos < n:
             end = min(pos + window, n)
             chunk = features[pos:end]
+            valid = end - pos
             if len(chunk) < window:
                 # Pad the last chunk
                 pad = np.zeros((window - len(chunk), INPUT_CHANNELS), dtype=np.float32)
                 chunk = np.vstack([chunk, pad])
             x = torch.tensor(chunk.T, dtype=torch.float32).unsqueeze(0).to(device)
             logits = model(x)  # (1, W, C)
-            probs = F.softmax(logits[0], dim=-1).cpu().numpy()
-            valid = end - pos
-            vote_sums[pos:end] += probs[:valid]
-            vote_observations[pos:end] += 1.0
+            if use_crf:
+                # Build a mask so the CRF only scores valid (non-padded)
+                # positions, then Viterbi-decode.
+                mask = torch.zeros(1, window, dtype=torch.bool, device=device)
+                mask[0, :valid] = True
+                decoded = model.crf_decode(logits, mask=mask)
+                tags = decoded[0][:valid]
+                # Use one-hot confidence for CRF decoded tags
+                for k, tag in enumerate(tags):
+                    vote_sums[pos + k, tag] += 1.0
+                vote_observations[pos:end] += 1.0
+            else:
+                probs = F.softmax(logits[0], dim=-1).cpu().numpy()
+                vote_sums[pos:end] += probs[:valid]
+                vote_observations[pos:end] += 1.0
             pos += stride
 
     mean_probs = vote_sums / np.maximum(vote_observations[:, None], 1.0)
@@ -868,6 +949,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Device (auto, cpu, cuda, cuda:0, …).",
     )
+    p_train.add_argument(
+        "--use-crf",
+        action="store_true",
+        default=False,
+        help="Append a CRF layer after the Bi-LSTM for transition-aware "
+        "segmentation (uses Viterbi decoding at inference).",
+    )
 
     # -- predict ------------------------------------------------------------
     p_pred = sub.add_parser(
@@ -906,6 +994,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Device (auto, cpu, cuda, cuda:0, …).",
     )
+    p_pred.add_argument(
+        "--use-crf",
+        action="store_true",
+        default=False,
+        help="Load a model with CRF layer and use Viterbi decoding.",
+    )
 
     return parser
 
@@ -933,6 +1027,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             lr=args.lr,
             batch_size=args.batch_size,
             device_name=args.device,
+            use_crf=args.use_crf,
         )
     elif args.command == "predict":
         predict_cnv(
@@ -944,6 +1039,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             stride=args.stride,
             min_confidence=args.min_confidence,
             device_name=args.device,
+            use_crf=args.use_crf,
         )
 
 
