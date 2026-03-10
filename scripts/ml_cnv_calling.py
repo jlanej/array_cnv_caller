@@ -712,8 +712,8 @@ def train_model(
                 if use_crf:
                     loss = model.crf_loss(logits, yb)
                     decoded = model.crf_decode(logits)
-                    preds = torch.tensor(
-                        decoded, dtype=torch.long, device=device,
+                    preds = torch.as_tensor(
+                        np.array(decoded), dtype=torch.long, device=device,
                     )
                 else:
                     loss = criterion(
@@ -811,8 +811,12 @@ def predict_cnv(
             if use_crf:
                 # Build a mask so the CRF only scores valid (non-padded)
                 # positions, then Viterbi-decode.
-                mask = torch.zeros(1, window, dtype=torch.bool, device=device)
-                mask[0, :valid] = True
+                mask = torch.ones(1, valid, dtype=torch.bool, device=device)
+                if valid < window:
+                    pad_mask = torch.zeros(
+                        1, window - valid, dtype=torch.bool, device=device,
+                    )
+                    mask = torch.cat([mask, pad_mask], dim=1)
                 decoded = model.crf_decode(logits, mask=mask)
                 tags = decoded[0][:valid]
                 # Use one-hot confidence for CRF decoded tags
