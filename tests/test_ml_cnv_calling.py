@@ -22,6 +22,7 @@ from ml_cnv_calling import (
     CNVSegmenter,
     DEFAULT_STRIDE,
     DEFAULT_WINDOW,
+    IGNORE_INDEX,
     INPUT_CHANNELS,
     NUM_CLASSES,
     ProbeDataset,
@@ -96,6 +97,114 @@ class TestCNVSegmenter:
         n_params = sum(p.numel() for p in model.parameters())
         assert n_params > 1000  # Not trivially small
         assert n_params < 10_000_000  # Not unreasonably large
+
+
+# ===================================================================
+# CRF integration tests
+# ===================================================================
+class TestCNVSegmenterCRF:
+    """Tests for the CRF-enabled CNN + Bi-LSTM model."""
+
+    def test_crf_output_shape(self):
+        """CRF model should produce the same emission shape as the base model."""
+        model = CNVSegmenter(use_crf=True)
+        x = torch.randn(2, INPUT_CHANNELS, 64)
+        out = model(x)
+        assert out.shape == (2, 64, NUM_CLASSES)
+
+    def test_crf_flag_stored(self):
+        """The use_crf flag should be accessible on the model."""
+        model_crf = CNVSegmenter(use_crf=True)
+        model_no = CNVSegmenter(use_crf=False)
+        assert model_crf.use_crf is True
+        assert model_no.use_crf is False
+
+    def test_crf_layer_exists(self):
+        """When use_crf=True, the model must have a CRF sub-module."""
+        model = CNVSegmenter(use_crf=True)
+        assert hasattr(model, "crf")
+        # CRF transition matrix should be (num_classes, num_classes)
+        assert model.crf.transitions.shape == (NUM_CLASSES, NUM_CLASSES)
+
+    def test_no_crf_layer_when_disabled(self):
+        """When use_crf=False, no CRF sub-module should exist."""
+        model = CNVSegmenter(use_crf=False)
+        assert not hasattr(model, "crf")
+
+    def test_crf_loss_scalar(self):
+        """crf_loss should return a scalar tensor with grad."""
+        model = CNVSegmenter(use_crf=True)
+        x = torch.randn(2, INPUT_CHANNELS, 64)
+        emissions = model(x)
+        tags = torch.randint(0, NUM_CLASSES, (2, 64))
+        loss = model.crf_loss(emissions, tags)
+        assert loss.dim() == 0  # scalar
+        assert loss.requires_grad
+
+    def test_crf_decode_output(self):
+        """crf_decode should return a list of lists with valid class ids."""
+        model = CNVSegmenter(use_crf=True)
+        model.eval()
+        x = torch.randn(3, INPUT_CHANNELS, 32)
+        with torch.no_grad():
+            emissions = model(x)
+            decoded = model.crf_decode(emissions)
+        assert len(decoded) == 3
+        for seq in decoded:
+            assert len(seq) == 32
+            assert all(0 <= tag < NUM_CLASSES for tag in seq)
+
+    def test_crf_decode_with_mask(self):
+        """crf_decode should respect a boolean mask."""
+        model = CNVSegmenter(use_crf=True)
+        model.eval()
+        x = torch.randn(1, INPUT_CHANNELS, 16)
+        mask = torch.zeros(1, 16, dtype=torch.bool)
+        mask[0, :10] = True  # only first 10 positions valid
+        with torch.no_grad():
+            emissions = model(x)
+            decoded = model.crf_decode(emissions, mask=mask)
+        assert len(decoded[0]) == 10
+
+    def test_crf_transition_matrix_updated(self):
+        """CRF transition parameters must receive gradient updates."""
+        model = CNVSegmenter(use_crf=True)
+        x = torch.randn(2, INPUT_CHANNELS, 64)
+        tags = torch.randint(0, NUM_CLASSES, (2, 64))
+
+        transitions_before = model.crf.transitions.data.clone()
+        emissions = model(x)
+        loss = model.crf_loss(emissions, tags)
+        loss.backward()
+
+        # Verify transitions received non-zero gradients
+        assert model.crf.transitions.grad is not None
+        assert model.crf.transitions.grad.abs().sum() > 0
+
+        # Simulate an optimiser step
+        with torch.no_grad():
+            model.crf.transitions -= 0.1 * model.crf.transitions.grad
+        assert not torch.equal(model.crf.transitions.data, transitions_before)
+
+    def test_crf_gradient_flow_through_full_model(self):
+        """Gradients should flow from CRF loss through LSTM and CNN."""
+        model = CNVSegmenter(use_crf=True)
+        x = torch.randn(2, INPUT_CHANNELS, 64, requires_grad=True)
+        emissions = model(x)
+        tags = torch.randint(0, NUM_CLASSES, (2, 64))
+        loss = model.crf_loss(emissions, tags)
+        loss.backward()
+        assert x.grad is not None
+        assert x.grad.abs().sum() > 0
+
+    def test_crf_parameter_count_increase(self):
+        """CRF model should have more parameters than the base model."""
+        model_base = CNVSegmenter(use_crf=False)
+        model_crf = CNVSegmenter(use_crf=True)
+        n_base = sum(p.numel() for p in model_base.parameters())
+        n_crf = sum(p.numel() for p in model_crf.parameters())
+        # CRF adds transitions (C*C) + start_transitions (C) + end_transitions (C)
+        assert n_crf > n_base
 
 
 # ===================================================================
@@ -195,10 +304,15 @@ class TestAssignCnLabels:
         # Region only overlaps 1 probe (pos=2000)
         bed_path.write_text("chr1\t1500\t2500\tDEL\n")
 
-        # With min_probes=2, this region should be skipped
+        # With min_probes=2, the SV is filtered; its probe should be
+        # masked (IGNORE_INDEX) rather than forced to NORMAL.
         labels, stats = assign_cn_labels(probes, str(bed_path), min_probes=2)
-        assert all(l == CLASS_NORMAL for l in labels)
+        assert labels[1] == IGNORE_INDEX  # pos=2000 covered by filtered SV
         assert stats["skipped_regions"] == 1
+        assert stats["probes_masked"] == 1
+        # Other probes remain NORMAL
+        assert labels[0] == CLASS_NORMAL
+        assert labels[2] == CLASS_NORMAL
 
     def test_stats_output(self, tmp_path):
         probes = pd.DataFrame(
@@ -244,6 +358,106 @@ class TestAssignCnLabels:
         assert labels[2] == CLASS_DEL
         assert labels[3] == CLASS_NORMAL  # end is excluded
 
+    def test_min_probes_filter_multiple_thresholds(self, tmp_path):
+        """SVs spanning fewer than N probes should be masked at various N."""
+        probes = pd.DataFrame(
+            {
+                "chrom": ["chr1"] * 10,
+                "pos": list(range(1000, 11000, 1000)),
+            }
+        )
+        bed_path = tmp_path / "truth.bed"
+        # Region overlaps 3 probes (pos=3000, 4000, 5000 in [2500,5500))
+        bed_path.write_text("chr1\t2500\t5500\tDEL\n")
+
+        # min_probes=3 → region kept (exactly 3 overlapping probes)
+        labels_3, stats_3 = assign_cn_labels(
+            probes, str(bed_path), min_probes=3
+        )
+        assert stats_3["used_regions"] == 1
+        assert stats_3["skipped_regions"] == 0
+        assert stats_3["probes_masked"] == 0
+        assert (labels_3 == CLASS_DEL).sum() == 3
+
+        # min_probes=4 → SV filtered; its 3 probes become IGNORE_INDEX
+        labels_4, stats_4 = assign_cn_labels(
+            probes, str(bed_path), min_probes=4
+        )
+        assert stats_4["used_regions"] == 0
+        assert stats_4["skipped_regions"] == 1
+        assert stats_4["probes_masked"] == 3
+        assert labels_4[2] == IGNORE_INDEX  # pos=3000
+        assert labels_4[3] == IGNORE_INDEX  # pos=4000
+        assert labels_4[4] == IGNORE_INDEX  # pos=5000
+        # Probes outside the filtered SV remain NORMAL
+        assert labels_4[0] == CLASS_NORMAL
+        assert labels_4[9] == CLASS_NORMAL
+
+        # min_probes=5 → same outcome
+        labels_5, stats_5 = assign_cn_labels(
+            probes, str(bed_path), min_probes=5
+        )
+        assert stats_5["probes_masked"] == 3
+        assert all(
+            labels_5[i] == IGNORE_INDEX for i in [2, 3, 4]
+        )
+
+    def test_min_probes_mixed_regions(self, tmp_path):
+        """With multiple regions, only those meeting the threshold are used."""
+        probes = pd.DataFrame(
+            {
+                "chrom": ["chr1"] * 10,
+                "pos": list(range(1000, 11000, 1000)),
+            }
+        )
+        bed_path = tmp_path / "truth.bed"
+        # Region A: overlaps 1 probe (pos=2000) → filtered, masked
+        # Region B: overlaps 5 probes (pos=5000..9000) → used
+        bed_path.write_text(
+            "chr1\t1500\t2500\tDEL\n"
+            "chr1\t4500\t9500\tDUP\n"
+        )
+
+        labels, stats = assign_cn_labels(
+            probes, str(bed_path), min_probes=3
+        )
+        assert stats["total_regions"] == 2
+        assert stats["used_regions"] == 1    # only region B
+        assert stats["skipped_regions"] == 1  # region A skipped
+        # Region A's probe is masked (possibly variant but unconfirmable)
+        assert labels[1] == IGNORE_INDEX  # pos=2000
+        # Region B probes should be DUP
+        assert labels[4] == CLASS_DUP  # pos=5000
+        assert labels[8] == CLASS_DUP  # pos=9000
+        assert stats["probes_masked"] == 1
+
+    def test_confirmed_sv_overrides_mask(self, tmp_path):
+        """A confirmed (large) SV that overlaps a masked probe should label it."""
+        probes = pd.DataFrame(
+            {
+                "chrom": ["chr1"] * 5,
+                "pos": [1000, 2000, 3000, 4000, 5000],
+            }
+        )
+        bed_path = tmp_path / "truth.bed"
+        # Small DEL (1 probe, pos=2000) – filtered
+        # Large DUP that also covers pos=2000 – confirmed
+        bed_path.write_text(
+            "chr1\t1500\t2500\tDEL\n"
+            "chr1\t1500\t4500\tDUP\n"
+        )
+
+        labels, stats = assign_cn_labels(
+            probes, str(bed_path), min_probes=2
+        )
+        # Small DEL skipped; large DUP used (covers pos=2000, 3000, 4000)
+        assert stats["used_regions"] == 1
+        assert stats["skipped_regions"] == 1
+        # pos=2000 should be DUP (confirmed by the large SV), not IGNORE
+        assert labels[1] == CLASS_DUP
+        assert labels[2] == CLASS_DUP
+        assert stats["probes_masked"] == 0
+
 
 class TestComputeClassWeights:
     """Tests for compute_class_weights()."""
@@ -270,6 +484,14 @@ class TestComputeClassWeights:
         assert weights.shape == (NUM_CLASSES,)
         # Class 2 has count=0 -> clipped to 1, gets highest weight
         assert weights[2] > weights[0]
+
+    def test_ignores_masked_probes(self):
+        """IGNORE_INDEX probes must not affect class weight computation."""
+        labels_with = np.array([0, IGNORE_INDEX, 1, IGNORE_INDEX, 2])
+        labels_without = np.array([0, 1, 2])
+        weights_with = compute_class_weights(labels_with)
+        weights_without = compute_class_weights(labels_without)
+        assert torch.allclose(weights_with, weights_without, atol=1e-5)
 
 
 class TestComputePerClassPrf:
@@ -429,6 +651,21 @@ class TestCLIParser:
         assert args.stride == 256
         assert args.device == "auto"
         assert args.output == "cnv_model.pt"
+        assert args.use_crf is False
+
+    def test_train_use_crf(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            ["train", "--bcf", "test.bcf", "--truth-bed", "truth.bed", "--use-crf"]
+        )
+        assert args.use_crf is True
+
+    def test_predict_use_crf(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            ["predict", "--bcf", "test.bcf", "--model", "model.pt", "--use-crf"]
+        )
+        assert args.use_crf is True
 
 
 # ===================================================================
@@ -445,6 +682,7 @@ class TestConstants:
         assert CLASS_DEL == 0
         assert CLASS_NORMAL == 1
         assert CLASS_DUP == 2
+        assert IGNORE_INDEX == -1  # must be negative (CrossEntropyLoss ignore_index)
 
     def test_input_channels(self):
         assert INPUT_CHANNELS == 3  # LRR, BAF, distance

@@ -56,6 +56,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
+from torchcrf import CRF
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -64,6 +65,7 @@ NUM_CLASSES = 3  # DEL=0, NORMAL=1, DUP=2
 CLASS_DEL = 0
 CLASS_NORMAL = 1
 CLASS_DUP = 2
+IGNORE_INDEX = -1  # probes excluded from loss (filtered SVs with ambiguous copy number)
 CLASS_NAMES = {CLASS_DEL: "DEL", CLASS_NORMAL: "NORMAL", CLASS_DUP: "DUP"}
 SVTYPE_TO_CLASS = {"DEL": CLASS_DEL, "DUP": CLASS_DUP}
 INPUT_CHANNELS = 3  # LRR, BAF, distance
@@ -99,6 +101,11 @@ class CNVSegmenter(nn.Module):
         Number of output classes (DEL, NORMAL, DUP).
     dropout : float
         Dropout probability applied between CNN and LSTM layers.
+    use_crf : bool
+        When *True* a CRF layer is appended after the fully-connected head.
+        During training the loss is the negative log-likelihood computed by
+        the CRF; during inference the Viterbi algorithm is used to decode
+        the most likely sequence of states.
     """
 
     def __init__(
@@ -110,8 +117,10 @@ class CNVSegmenter(nn.Module):
         lstm_layers: int = 2,
         num_classes: int = NUM_CLASSES,
         dropout: float = 0.2,
+        use_crf: bool = False,
     ) -> None:
         super().__init__()
+        self.use_crf = use_crf
 
         # -- 1-D CNN stack (causal-ish, same-length padding) ----------------
         layers: list[nn.Module] = []
@@ -141,8 +150,12 @@ class CNVSegmenter(nn.Module):
         # -- Fully-connected head -------------------------------------------
         self.fc = nn.Linear(lstm_hidden * 2, num_classes)
 
+        # -- Optional CRF layer --------------------------------------------
+        if use_crf:
+            self.crf = CRF(num_classes, batch_first=True)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
+        """Forward pass – returns emission logits.
 
         Parameters
         ----------
@@ -152,7 +165,8 @@ class CNVSegmenter(nn.Module):
         Returns
         -------
         Tensor
-            Shape ``(batch, seq_len, num_classes)`` – logits per probe.
+            Shape ``(batch, seq_len, num_classes)`` – logits (emissions)
+            per probe.
         """
         # CNN: (B, C, L) -> (B, cnn_ch, L)
         h = self.cnn(x)
@@ -162,6 +176,51 @@ class CNVSegmenter(nn.Module):
         h, _ = self.lstm(h)
         # FC: (B, L, num_classes)
         return self.fc(h)
+
+    # -- CRF helpers --------------------------------------------------------
+
+    def crf_loss(
+        self, emissions: torch.Tensor, tags: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute the CRF negative log-likelihood loss.
+
+        Parameters
+        ----------
+        emissions : Tensor
+            Shape ``(batch, seq_len, num_classes)`` – output of ``forward()``.
+        tags : Tensor
+            Shape ``(batch, seq_len)`` – ground-truth class indices.
+        mask : Tensor, optional
+            Boolean mask of shape ``(batch, seq_len)``.
+
+        Returns
+        -------
+        Tensor
+            Scalar loss (negated log-likelihood).
+        """
+        # torchcrf.CRF.forward returns log-likelihood; negate for loss
+        return -self.crf(emissions, tags, mask=mask)
+
+    def crf_decode(
+        self, emissions: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> List[List[int]]:
+        """Viterbi-decode the most likely tag sequence.
+
+        Parameters
+        ----------
+        emissions : Tensor
+            Shape ``(batch, seq_len, num_classes)``.
+        mask : Tensor, optional
+            Boolean mask of shape ``(batch, seq_len)``.
+
+        Returns
+        -------
+        list[list[int]]
+            Best tag sequence for each item in the batch.
+        """
+        return self.crf.decode(emissions, mask=mask)
 
 
 # ===================================================================
@@ -254,15 +313,22 @@ def assign_cn_labels(
 
     Probes overlapping a truth region inherit its class (DEL=0 or DUP=2);
     all others are labelled NORMAL (class 1).  Truth regions overlapping
-    fewer than *min_probes* array probes are excluded from labelling.
+    fewer than *min_probes* array probes are excluded from labelling and
+    their probes are marked with ``IGNORE_INDEX`` (-1) so they are masked
+    out of the loss calculation entirely.  This avoids teaching the model
+    that ambiguous (possibly-variant but unconfirmable) probes are NORMAL.
+    A used (larger) SV always overrides the ignore mark.
 
     Returns
     -------
     labels : np.ndarray
-        Per-probe class labels (int64): 0=DEL, 1=NORMAL, 2=DUP.
+        Per-probe class labels (int64): 0=DEL, 1=NORMAL, 2=DUP,
+        or ``IGNORE_INDEX`` (-1) for probes that should be excluded from
+        the training loss.
     stats : dict
         ``total_regions``, ``used_regions``, ``skipped_regions``,
-        ``probes_labeled`` (count of non-NORMAL probes).
+        ``probes_labeled`` (count of DEL/DUP probes),
+        ``probes_masked`` (count of IGNORE_INDEX probes).
     """
     truth = pd.read_csv(
         truth_bed,
@@ -272,6 +338,8 @@ def assign_cn_labels(
         dtype={"chrom": str, "start": int, "end": int, "svtype": str},
     )
     labels = np.full(len(probes), CLASS_NORMAL, dtype=np.int64)
+    # Track probes touched by filtered SVs; used SVs will override this.
+    possibly_variant = np.zeros(len(probes), dtype=bool)
 
     total_regions = 0
     used_regions = 0
@@ -294,15 +362,27 @@ def assign_cn_labels(
             n_overlap = int(overlap.sum())
             if n_overlap < min_probes:
                 skipped_regions += 1
+                # Mark as possibly variant so these probes are excluded from
+                # the loss rather than incorrectly labelled NORMAL.
+                possibly_variant[p_idx[overlap]] = True
                 continue
             used_regions += 1
             labels[p_idx[overlap]] = class_label
+            # A confirmed SV overrides any earlier possibly-variant mark.
+            possibly_variant[p_idx[overlap]] = False
+
+    # Probes covered only by filtered SVs are masked out of the loss.
+    mask_idx = possibly_variant & (labels == CLASS_NORMAL)
+    labels[mask_idx] = IGNORE_INDEX
 
     stats = {
         "total_regions": total_regions,
         "used_regions": used_regions,
         "skipped_regions": skipped_regions,
-        "probes_labeled": int((labels != CLASS_NORMAL).sum()),
+        "probes_labeled": int(
+            ((labels != CLASS_NORMAL) & (labels != IGNORE_INDEX)).sum()
+        ),
+        "probes_masked": int((labels == IGNORE_INDEX).sum()),
     }
     return labels, stats
 
@@ -415,8 +495,12 @@ class ProbeDataset(Dataset):
 # Training
 # ===================================================================
 def compute_class_weights(labels: np.ndarray) -> torch.Tensor:
-    """Inverse-frequency class weights for weighted cross-entropy."""
-    counts = np.bincount(labels, minlength=NUM_CLASSES).astype(np.float64)
+    """Inverse-frequency class weights for weighted cross-entropy.
+
+    ``IGNORE_INDEX`` probes are excluded before computing frequencies.
+    """
+    valid = labels[labels != IGNORE_INDEX]
+    counts = np.bincount(valid, minlength=NUM_CLASSES).astype(np.float64)
     counts = np.clip(counts, 1, None)  # avoid division by zero
     weights = 1.0 / counts
     weights /= weights.sum()
@@ -454,6 +538,7 @@ def train_model(
     lr: float = DEFAULT_LR,
     batch_size: int = DEFAULT_BATCH,
     device_name: str = "auto",
+    use_crf: bool = False,
 ) -> None:
     """End-to-end training loop.
 
@@ -522,12 +607,14 @@ def train_model(
             all_features.append(features)
             all_labels.append(labels)
             LOG.info(
-                "  %s: %d probes, %d/%d truth regions used, %d probes labeled",
+                "  %s: %d probes, %d/%d truth regions used, "
+                "%d probes labeled, %d masked",
                 s,
                 len(probes),
                 stats["used_regions"],
                 stats["total_regions"],
                 stats["probes_labeled"],
+                stats["probes_masked"],
             )
 
         if not all_features:
@@ -586,10 +673,12 @@ def train_model(
             "Loaded %d probes – class distribution: %s", len(probes), class_dist
         )
         LOG.info(
-            "Truth regions: %d used, %d skipped (min_probes=%d)",
+            "Truth regions: %d used, %d skipped (min_probes=%d), "
+            "%d probes masked",
             stats["used_regions"],
             stats["skipped_regions"],
             min_probes,
+            stats["probes_masked"],
         )
 
         n = len(features)
@@ -611,9 +700,9 @@ def train_model(
     )
 
     # -- Model & optimiser --------------------------------------------------
-    model = CNVSegmenter().to(device)
+    model = CNVSegmenter(use_crf=use_crf).to(device)
     class_weights = compute_class_weights(all_train_labels).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, ignore_index=IGNORE_INDEX)
     optimiser = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimiser, mode="min", factor=0.5, patience=3
@@ -629,7 +718,17 @@ def train_model(
         for xb, yb in train_dl:
             xb, yb = xb.to(device), yb.to(device)
             logits = model(xb)  # (B, W, C)
-            loss = criterion(logits.reshape(-1, NUM_CLASSES), yb.reshape(-1))
+            if use_crf:
+                mask = yb != IGNORE_INDEX
+                if not mask.any():
+                    continue
+                # torchcrf requires non-negative tag indices.  Replace
+                # IGNORE_INDEX with CLASS_NORMAL as a harmless placeholder;
+                # these positions are fully excluded by the boolean mask.
+                tags = yb.masked_fill(~mask, CLASS_NORMAL)
+                loss = model.crf_loss(logits, tags, mask=mask)
+            else:
+                loss = criterion(logits.reshape(-1, NUM_CLASSES), yb.reshape(-1))
             optimiser.zero_grad()
             loss.backward()
             optimiser.step()
@@ -647,15 +746,38 @@ def train_model(
             for xb, yb in val_dl:
                 xb, yb = xb.to(device), yb.to(device)
                 logits = model(xb)
-                loss = criterion(
-                    logits.reshape(-1, NUM_CLASSES), yb.reshape(-1)
-                )
+                if use_crf:
+                    mask = yb != IGNORE_INDEX
+                    if not mask.any():
+                        continue
+                    tags = yb.masked_fill(~mask, CLASS_NORMAL)
+                    loss = model.crf_loss(logits, tags, mask=mask)
+                    decoded = model.crf_decode(logits, mask=mask)
+                    # Pad decoded sequences back to full window length so
+                    # shapes align for masking below.  Padding with
+                    # IGNORE_INDEX makes it explicit these positions are
+                    # excluded from metrics by valid_mask.
+                    pad_decoded = [
+                        seq + [IGNORE_INDEX] * (yb.shape[1] - len(seq))
+                        for seq in decoded
+                    ]
+                    preds = torch.as_tensor(
+                        np.array(pad_decoded), dtype=torch.long, device=device,
+                    )
+                else:
+                    loss = criterion(
+                        logits.reshape(-1, NUM_CLASSES), yb.reshape(-1)
+                    )
+                    preds = logits.argmax(dim=-1)
                 val_loss += loss.item() * xb.size(0)
-                preds = logits.argmax(dim=-1)
-                correct += (preds == yb).sum().item()
-                total += yb.numel()
-                y_true_parts.append(yb.cpu().reshape(-1).numpy())
-                y_pred_parts.append(preds.cpu().reshape(-1).numpy())
+                # Exclude IGNORE_INDEX probes from accuracy and PRF metrics.
+                valid_mask = (yb != IGNORE_INDEX).reshape(-1)
+                y_true_flat = yb.reshape(-1)[valid_mask].cpu().numpy()
+                y_pred_flat = preds.reshape(-1)[valid_mask].cpu().numpy()
+                correct += int((y_true_flat == y_pred_flat).sum())
+                total += int(valid_mask.sum())
+                y_true_parts.append(y_true_flat)
+                y_pred_parts.append(y_pred_flat)
         val_loss /= max(len(val_ds), 1)
         val_acc = correct / max(total, 1)
         y_true = np.concatenate(y_true_parts) if y_true_parts else np.array([], dtype=np.int64)
@@ -700,6 +822,7 @@ def predict_cnv(
     stride: int = DEFAULT_STRIDE,
     min_confidence: float = 0.5,
     device_name: str = "auto",
+    use_crf: bool = False,
 ) -> None:
     """Run sliding-window inference and write a BED file of CNV calls."""
 
@@ -709,7 +832,7 @@ def predict_cnv(
         device = torch.device(device_name)
 
     # -- Load model ---------------------------------------------------------
-    model = CNVSegmenter().to(device)
+    model = CNVSegmenter(use_crf=use_crf).to(device)
     model.load_state_dict(
         torch.load(model_path, map_location=device, weights_only=True)
     )
@@ -732,16 +855,32 @@ def predict_cnv(
         while pos < n:
             end = min(pos + window, n)
             chunk = features[pos:end]
+            valid = end - pos
             if len(chunk) < window:
                 # Pad the last chunk
                 pad = np.zeros((window - len(chunk), INPUT_CHANNELS), dtype=np.float32)
                 chunk = np.vstack([chunk, pad])
             x = torch.tensor(chunk.T, dtype=torch.float32).unsqueeze(0).to(device)
             logits = model(x)  # (1, W, C)
-            probs = F.softmax(logits[0], dim=-1).cpu().numpy()
-            valid = end - pos
-            vote_sums[pos:end] += probs[:valid]
-            vote_observations[pos:end] += 1.0
+            if use_crf:
+                # Build a mask so the CRF only scores valid (non-padded)
+                # positions, then Viterbi-decode.
+                mask = torch.ones(1, valid, dtype=torch.bool, device=device)
+                if valid < window:
+                    pad_mask = torch.zeros(
+                        1, window - valid, dtype=torch.bool, device=device,
+                    )
+                    mask = torch.cat([mask, pad_mask], dim=1)
+                decoded = model.crf_decode(logits, mask=mask)
+                tags = decoded[0][:valid]
+                # Use one-hot confidence for CRF decoded tags
+                for k, tag in enumerate(tags):
+                    vote_sums[pos + k, tag] += 1.0
+                vote_observations[pos:end] += 1.0
+            else:
+                probs = F.softmax(logits[0], dim=-1).cpu().numpy()
+                vote_sums[pos:end] += probs[:valid]
+                vote_observations[pos:end] += 1.0
             pos += stride
 
     mean_probs = vote_sums / np.maximum(vote_observations[:, None], 1.0)
@@ -868,6 +1007,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Device (auto, cpu, cuda, cuda:0, …).",
     )
+    p_train.add_argument(
+        "--use-crf",
+        action="store_true",
+        default=False,
+        help="Append a CRF layer after the Bi-LSTM for transition-aware "
+        "segmentation (uses Viterbi decoding at inference).",
+    )
 
     # -- predict ------------------------------------------------------------
     p_pred = sub.add_parser(
@@ -906,6 +1052,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Device (auto, cpu, cuda, cuda:0, …).",
     )
+    p_pred.add_argument(
+        "--use-crf",
+        action="store_true",
+        default=False,
+        help="Load a model with CRF layer and use Viterbi decoding.",
+    )
 
     return parser
 
@@ -933,6 +1085,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             lr=args.lr,
             batch_size=args.batch_size,
             device_name=args.device,
+            use_crf=args.use_crf,
         )
     elif args.command == "predict":
         predict_cnv(
@@ -944,6 +1097,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             stride=args.stride,
             min_confidence=args.min_confidence,
             device_name=args.device,
+            use_crf=args.use_crf,
         )
 
 
