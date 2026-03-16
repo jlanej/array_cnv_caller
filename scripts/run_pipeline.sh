@@ -133,7 +133,7 @@ OVERLAP_REPORT="$OUTDIR/overlap_report.tsv"
 PREDICTIONS_DIR="$OUTDIR/predictions"
 LITMUS_DIR="$OUTDIR/litmus"
 
-TOTAL_STEPS=$(( 1 + 1 + (PREDICT == 1 ? 1 : 0) + (LITMUS == 1 ? 1 : 0) ))
+TOTAL_STEPS=$((2 + (PREDICT == 1) + (LITMUS == 1)))
 
 echo "============================================================"
 echo "  array_cnv_caller – Training Pipeline"

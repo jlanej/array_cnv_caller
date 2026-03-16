@@ -313,14 +313,16 @@ class TestBuildDashboard:
         summary = compute_summary_stats(probe_stats_df)
         out = str(tmp_path / "test_report.html")
         build_dashboard(probe_stats_df, summary, out)
-        content = open(out).read()
+        with open(out) as f:
+            content = f.read()
         assert "plotly" in content.lower()
 
     def test_html_contains_states(self, probe_stats_df, tmp_path):
         summary = compute_summary_stats(probe_stats_df)
         out = str(tmp_path / "test_report.html")
         build_dashboard(probe_stats_df, summary, out)
-        content = open(out).read()
+        with open(out) as f:
+            content = f.read()
         for state in ("DEL", "NORMAL", "DUP"):
             assert state in content
 
@@ -328,7 +330,8 @@ class TestBuildDashboard:
         summary = compute_summary_stats(probe_stats_df)
         out = str(tmp_path / "test_report.html")
         build_dashboard(probe_stats_df, summary, out)
-        content = open(out).read()
+        with open(out) as f:
+            content = f.read()
         assert "Interactive Filtering" in content
         assert "applyFilters" in content
 
@@ -336,7 +339,8 @@ class TestBuildDashboard:
         summary = compute_summary_stats(probe_stats_df)
         out = str(tmp_path / "test_report.html")
         build_dashboard(probe_stats_df, summary, out)
-        content = open(out).read()
+        with open(out) as f:
+            content = f.read()
         assert "<!DOCTYPE html>" in content
         assert "</html>" in content
 

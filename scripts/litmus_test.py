@@ -51,6 +51,14 @@ SVTYPE_TO_CLASS = {"DEL": CLASS_DEL, "DUP": CLASS_DUP}
 LOG = logging.getLogger(__name__)
 
 
+def _chrom_sort_key(c: str) -> Tuple[int, int]:
+    """Sort key that orders numeric chromosomes first, then alpha."""
+    suffix = c.replace("chr", "")
+    if suffix.isdigit():
+        return (0, int(suffix))
+    return (1, ord(suffix[0]) if suffix else 0)
+
+
 # ===================================================================
 # BCF / BED helpers
 # ===================================================================
@@ -522,13 +530,7 @@ def build_dashboard(
     )
 
     # ── 4. Per-chromosome LRR box-plots ──────────────────────────────
-    chroms = sorted(
-        df["chrom"].unique(),
-        key=lambda c: (
-            0 if c.replace("chr", "").isdigit() else 1,
-            int(c.replace("chr", "")) if c.replace("chr", "").isdigit() else ord(c.replace("chr", "")[0]),
-        ),
-    )
+    chroms = sorted(df["chrom"].unique(), key=_chrom_sort_key)
     fig_chrom = go.Figure()
     for state in STATES:
         sub = df[df["state"] == state]
@@ -706,13 +708,7 @@ def _filter_panel_html(df: pd.DataFrame) -> str:
     # Encode lightweight per-state arrays in JSON for JS consumption.
     import json
 
-    chroms = sorted(
-        df["chrom"].unique().tolist(),
-        key=lambda c: (
-            0 if c.replace("chr", "").isdigit() else 1,
-            int(c.replace("chr", "")) if c.replace("chr", "").isdigit() else 0,
-        ),
-    )
+    chroms = sorted(df["chrom"].unique().tolist(), key=_chrom_sort_key)
     samples = sorted(df["sample"].unique().tolist())
 
     # Sub-sample for the filter panel to keep HTML size manageable
