@@ -16,6 +16,10 @@ pipeline_output/
 
 # Litmus test outputs
 litmus_output/
+litmus_build/
+
+# GitHub Pages build
+_site/
 
 # Apptainer / Singularity images
 *.sif

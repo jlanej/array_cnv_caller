@@ -25,15 +25,29 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), os.pardir, "scripts"))
 
 from prepare_truth_set import parse_sv_id, process_vcf
+from litmus_test import collect_probe_data, compute_summary_stats, build_dashboard
 
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 TEST_VCF = os.path.join(FIXTURES_DIR, "test_samples.vcf.gz")
+ARRAY_VCF = os.path.join(
+    FIXTURES_DIR, "stage2_reclustered.selected.array.samples.vcf.gz"
+)
 EVAL_SAMPLES = [
     "HG00268",
     "HG00513",
     "HG00731",
     "HG02554",
     "HG02953",
+    "NA12878",
+    "NA19129",
+    "NA19238",
+    "NA19331",
+    "NA19347",
+]
+ARRAY_SAMPLES = [
+    "HG00268",
+    "HG00513",
+    "HG00731",
     "NA12878",
     "NA19129",
     "NA19238",
@@ -150,3 +164,110 @@ class TestTruthSetGeneration:
         )
         metrics = dict(zip(summary["metric"], summary["value"]))
         assert int(metrics["total_samples"]) == 10
+
+
+class TestLitmusPipeline:
+    """Integration test for the litmus pipeline using the array VCF.
+
+    Runs the full litmus pipeline (truth-set generation → probe collection →
+    summary statistics → HTML dashboard) on the stage2 array VCF fixture
+    from illumina_idat_processing.
+    """
+
+    @pytest.fixture
+    def array_vcf(self):
+        """Return path to the stage2 array VCF with FORMAT/LRR and FORMAT/BAF."""
+        if not os.path.exists(ARRAY_VCF):
+            pytest.skip("Array VCF not found at " + ARRAY_VCF)
+        return ARRAY_VCF
+
+    @pytest.fixture
+    def truth_dir(self, array_vcf, tmp_path):
+        """Generate truth BED files from the shapeit5-phased VCF for the 8 array samples."""
+        truth_output = str(tmp_path / "truth_sets")
+        process_vcf(TEST_VCF, truth_output, min_size=1000)
+        return os.path.join(truth_output, "per_sample")
+
+    def test_litmus_runs_to_completion(self, array_vcf, truth_dir, tmp_path):
+        """The litmus pipeline should run end-to-end without errors."""
+        df = collect_probe_data(array_vcf, truth_dir)
+        assert len(df) > 0, "No probe data collected"
+
+        summary = compute_summary_stats(df)
+        assert len(summary) > 0, "Summary statistics are empty"
+
+        html_path = str(tmp_path / "litmus_report.html")
+        build_dashboard(df, summary, html_path)
+        assert os.path.isfile(html_path), "HTML report not created"
+
+    def test_litmus_produces_probe_data(self, array_vcf, truth_dir):
+        """Probe data should contain all expected columns."""
+        df = collect_probe_data(array_vcf, truth_dir)
+        expected_cols = {"sample", "chrom", "pos", "lrr", "baf", "state", "region_size"}
+        assert expected_cols == set(df.columns)
+
+    def test_litmus_samples_match(self, array_vcf, truth_dir):
+        """Collected probes should come from the matched array samples."""
+        df = collect_probe_data(array_vcf, truth_dir)
+        collected_samples = set(df["sample"].unique())
+        # All collected samples must be among the expected array samples
+        assert collected_samples.issubset(set(ARRAY_SAMPLES))
+        assert len(collected_samples) > 0
+
+    def test_litmus_has_all_states(self, array_vcf, truth_dir):
+        """Probe data should include DEL, NORMAL, and DUP states."""
+        df = collect_probe_data(array_vcf, truth_dir)
+        states = set(df["state"].unique())
+        assert "NORMAL" in states, "No NORMAL probes found"
+        # At least one CNV state should appear
+        assert states & {"DEL", "DUP"}, "No CNV probes (DEL/DUP) found"
+
+    def test_litmus_summary_stats_complete(self, array_vcf, truth_dir):
+        """Summary statistics should have rows for each state/metric pair."""
+        df = collect_probe_data(array_vcf, truth_dir)
+        summary = compute_summary_stats(df)
+        # Should have entries for both lrr and baf
+        assert set(summary["metric"]) == {"lrr", "baf"}
+        # At minimum NORMAL should be present
+        assert "NORMAL" in set(summary["state"])
+
+    def test_litmus_html_is_informative(self, array_vcf, truth_dir, tmp_path):
+        """The HTML dashboard should contain all key sections."""
+        df = collect_probe_data(array_vcf, truth_dir)
+        summary = compute_summary_stats(df)
+        html_path = str(tmp_path / "litmus_report.html")
+        build_dashboard(df, summary, html_path)
+
+        with open(html_path) as f:
+            content = f.read()
+
+        # Structural checks
+        assert "<!DOCTYPE html>" in content
+        assert "</html>" in content
+        assert "plotly" in content.lower()
+
+        # Key sections present
+        assert "Summary Statistics" in content
+        assert "LRR" in content
+        assert "BAF" in content
+        assert "Interactive Filtering" in content
+        assert "applyFilters" in content
+
+        # CN states appear in the report
+        for state in ("DEL", "NORMAL", "DUP"):
+            assert state in content
+
+    def test_litmus_html_has_sample_info(self, array_vcf, truth_dir, tmp_path):
+        """The HTML dashboard should reference at least some array sample names."""
+        df = collect_probe_data(array_vcf, truth_dir)
+        summary = compute_summary_stats(df)
+        html_path = str(tmp_path / "litmus_report.html")
+        build_dashboard(df, summary, html_path)
+
+        with open(html_path) as f:
+            content = f.read()
+
+        # At least some sample names should appear in the filter dropdown
+        collected_samples = df["sample"].unique()
+        for sample in collected_samples:
+            assert sample in content, f"Sample {sample} not found in HTML"
