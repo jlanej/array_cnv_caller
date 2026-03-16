@@ -14,6 +14,9 @@ truth_sets/
 # Pipeline outputs
 pipeline_output/
 
+# Litmus test outputs
+litmus_output/
+
 # Apptainer / Singularity images
 *.sif
 

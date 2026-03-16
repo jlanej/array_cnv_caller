@@ -170,6 +170,55 @@ Columns: `chrom  start  end  svtype  num_probes`
 calls when building CNV segments, reducing low-confidence edge artifacts in
 predicted DEL/DUP regions.
 
+### Litmus Test – LRR / BAF Probe Assessment
+
+The litmus test pipeline assesses how well LRR and BAF signals separate
+deletions, duplications, and copy-number neutral regions.  It reads the
+multi-sample BCF in a **single pass** (efficient for large cohorts) and
+produces an interactive Plotly dashboard, a probe-level TSV, and summary
+statistics.  `litmus_test.py` is fully bundled in the container image —
+no local installation required.
+
+Run via Apptainer as a standalone step:
+
+```bash
+apptainer exec --bind $PWD array_cnv_caller_main.sif \
+    python /app/scripts/litmus_test.py \
+    --bcf $PWD/1000g_multisample.bcf \
+    --truth-dir $PWD/pipeline_output/truth_sets/per_sample/ \
+    --output-dir $PWD/litmus_output
+```
+
+Or append `--litmus` to the full pipeline one-liner to run it
+automatically after training:
+
+```bash
+apptainer exec --nv --bind $PWD array_cnv_caller_main.sif \
+    bash /app/scripts/run_pipeline.sh \
+    --bcf $PWD/1000g_multisample.bcf \
+    --outdir $PWD/pipeline_output \
+    --litmus
+```
+
+| Option | Description |
+|--------|-------------|
+| `--bcf` | Multi-sample BCF with `FORMAT/LRR` and `FORMAT/BAF` (required). |
+| `--truth-dir` | Directory of per-sample `<sample>.bed` truth files (required). |
+| `--output-dir` | Output directory (default: `litmus_output`). |
+| `--max-samples` | Cap the number of samples processed (default: all matched). |
+
+#### Outputs
+
+| File | Description |
+|------|-------------|
+| `litmus_report.html` | Self-contained interactive dashboard (histograms, violin plots, scatter plots, per-chromosome breakdowns, filtering panel). |
+| `probe_stats.tsv.gz` | Probe-level table (`sample, chrom, pos, lrr, baf, state, region_size`) for downstream analyses. |
+| `summary_stats.tsv` | Per-state aggregate statistics (mean, median, std, IQR, skewness, kurtosis, percentiles) for LRR and BAF. |
+
+The dashboard includes interactive filtering controls (chromosome, sample,
+minimum region size, LRR range) that dynamically regenerate histograms and
+summary tables on the fly.
+
 ## Data Sources & Citations
 
 This project relies on the following data sources and publications:
@@ -240,6 +289,13 @@ apptainer exec --nv --bind $PWD array_cnv_caller_main.sif \
     --bcf $PWD/1000g_multisample.bcf \
     --outdir $PWD/pipeline_output \
     --predict
+
+# With litmus test (LRR/BAF probe assessment dashboard)
+apptainer exec --nv --bind $PWD array_cnv_caller_main.sif \
+    bash /app/scripts/run_pipeline.sh \
+    --bcf $PWD/1000g_multisample.bcf \
+    --outdir $PWD/pipeline_output \
+    --litmus
 ```
 
 The pipeline:
@@ -250,6 +306,8 @@ The pipeline:
    truth BED file.  Samples are split 90/10 by sample for train/validation to
    prevent data leakage.
 3. **(Optional)** Runs prediction on BCF samples using the trained model.
+4. **(Optional)** Runs the litmus test, generating an interactive LRR/BAF
+   probe assessment dashboard in `<outdir>/litmus/`.
 
 Pipeline options:
 
@@ -264,6 +322,8 @@ Pipeline options:
 | `--min-probes` | 5 | Min array probes per truth region |
 | `--device` | `auto` | `auto`, `cpu`, `cuda`, `cuda:0`, … |
 | `--predict` | off | Also run prediction after training |
+| `--litmus` | off | Run LRR/BAF probe assessment dashboard after training |
+| `--litmus-max-samples` | all | Cap samples processed by the litmus test |
 
 ### Running individual steps
 
@@ -294,6 +354,13 @@ apptainer exec --nv --bind $PWD $SIF \
     --bcf $PWD/sample.bcf \
     --model $PWD/cnv_model.pt \
     --output $PWD/cnv_calls.bed
+
+# Litmus test – LRR/BAF probe assessment dashboard (single-pass BCF scan)
+apptainer exec --bind $PWD $SIF \
+    python /app/scripts/litmus_test.py \
+    --bcf $PWD/1000g_multisample.bcf \
+    --truth-dir $PWD/truth_sets/per_sample/ \
+    --output-dir $PWD/litmus_output
 ```
 
 > **GPU support:** Pass `--nv` to `apptainer exec` for NVIDIA GPU passthrough.

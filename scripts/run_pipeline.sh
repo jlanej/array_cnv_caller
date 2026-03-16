@@ -5,6 +5,7 @@
 #   1. Prepare per-sample BED truth files from the shapeit5-phased SV VCF
 #   2. Train the CNVSegmenter model on a multi-sample BCF
 #   3. (Optional) Predict CNVs for every sample in the BCF
+#   4. (Optional) Run the litmus test (LRR/BAF probe assessment dashboard)
 #
 # All prerequisite scripts and resources are pre-packed in the container
 # image published to ghcr.io/jlanej/array_cnv_caller.  On HPC clusters,
@@ -12,10 +13,11 @@
 #
 #   apptainer pull docker://ghcr.io/jlanej/array_cnv_caller:main
 #
-#   apptainer exec --nv --bind /scratch:/scratch array_cnv_caller_main.sif \
+#   apptainer exec --nv --bind $PWD array_cnv_caller_main.sif \
 #       bash /app/scripts/run_pipeline.sh \
-#       --bcf /scratch/1000g_multisample.bcf \
-#       --outdir /scratch/cnv_output
+#       --bcf $PWD/1000g_multisample.bcf \
+#       --outdir $PWD/pipeline_output \
+#       --litmus
 #
 # The script auto-detects whether it is running inside the container
 # (/app layout) or from a local repository checkout.
@@ -34,6 +36,8 @@
 #   --min-probes  Minimum probes overlapping a truth region (default: 5)
 #   --device    Device selection (default: auto)
 #   --predict   Also run prediction on every BCF sample after training
+#   --litmus    Run LRR/BAF probe assessment dashboard after training
+#   --litmus-max-samples N  Cap samples for litmus test (default: all matched)
 
 set -euo pipefail
 
@@ -47,6 +51,8 @@ LR=0.001
 MIN_PROBES=5
 DEVICE="auto"
 PREDICT=0
+LITMUS=0
+LITMUS_MAX_SAMPLES=""
 
 # ── Parse arguments ──────────────────────────────────────────────────────
 usage() {
@@ -65,6 +71,8 @@ Optional:
   --min-probes N      Min array probes per truth region (default: 5)
   --device DEV        Device: auto, cpu, cuda, cuda:0 (default: auto)
   --predict           Run prediction on every BCF sample after training
+  --litmus            Run litmus test (LRR/BAF probe assessment dashboard)
+  --litmus-max-samples N  Cap samples for litmus test (default: all matched)
   -h, --help          Show this help message
 EOF
     exit "${1:-0}"
@@ -81,6 +89,8 @@ while [[ $# -gt 0 ]]; do
         --min-probes) MIN_PROBES="$2"; shift 2 ;;
         --device)     DEVICE="$2";     shift 2 ;;
         --predict)    PREDICT=1;       shift ;;
+        --litmus)     LITMUS=1;        shift ;;
+        --litmus-max-samples) LITMUS_MAX_SAMPLES="$2"; shift 2 ;;
         -h|--help)    usage 0 ;;
         *)            echo "Error: unknown option: $1" >&2; usage 1 ;;
     esac
@@ -125,8 +135,9 @@ TRUTH_DIR="$OUTDIR/truth_sets"
 MODEL_PATH="$OUTDIR/cnv_model.pt"
 OVERLAP_REPORT="$OUTDIR/overlap_report.tsv"
 PREDICTIONS_DIR="$OUTDIR/predictions"
+LITMUS_DIR="$OUTDIR/litmus"
 
-TOTAL_STEPS=$([ "$PREDICT" -eq 1 ] && echo '3' || echo '2')
+TOTAL_STEPS=$((2 + (PREDICT == 1) + (LITMUS == 1)))
 
 echo "============================================================"
 echo "  array_cnv_caller – Training Pipeline"
@@ -142,6 +153,7 @@ echo "  Batch size:     $BATCH_SIZE"
 echo "  Learning rate:  $LR"
 echo "  Min probes:     $MIN_PROBES"
 echo "  Predict:        $([ "$PREDICT" -eq 1 ] && echo 'yes' || echo 'no')"
+echo "  Litmus test:    $([ "$LITMUS" -eq 1 ] && echo 'yes' || echo 'no')"
 echo ""
 
 # ── Step 1: Prepare truth-set BED files ──────────────────────────────────
@@ -183,9 +195,10 @@ echo "  → Overlap report: $OVERLAP_REPORT"
 echo ""
 
 # ── Step 3 (optional): Predict CNVs ─────────────────────────────────────
+STEP_NUM=3
 if [[ "$PREDICT" -eq 1 ]]; then
     echo "────────────────────────────────────────────────────────────"
-    echo "  Step 3/$TOTAL_STEPS: Predict CNVs for BCF samples"
+    echo "  Step $STEP_NUM/$TOTAL_STEPS: Predict CNVs for BCF samples"
     echo "────────────────────────────────────────────────────────────"
 
     mkdir -p "$PREDICTIONS_DIR"
@@ -198,6 +211,31 @@ if [[ "$PREDICT" -eq 1 ]]; then
 
     echo ""
     echo "  → Predictions saved to: $PREDICTIONS_DIR/"
+    echo ""
+    STEP_NUM=$((STEP_NUM + 1))
+fi
+
+# ── Step N (optional): Litmus test – LRR/BAF probe assessment ────────────
+if [[ "$LITMUS" -eq 1 ]]; then
+    echo "────────────────────────────────────────────────────────────"
+    echo "  Step $STEP_NUM/$TOTAL_STEPS: Litmus test (LRR/BAF probe dashboard)"
+    echo "────────────────────────────────────────────────────────────"
+
+    LITMUS_ARGS=(
+        --bcf "$BCF"
+        --truth-dir "$TRUTH_DIR/per_sample/"
+        --output-dir "$LITMUS_DIR"
+    )
+    if [[ -n "$LITMUS_MAX_SAMPLES" ]]; then
+        LITMUS_ARGS+=(--max-samples "$LITMUS_MAX_SAMPLES")
+    fi
+
+    python "$APP_ROOT/scripts/litmus_test.py" "${LITMUS_ARGS[@]}"
+
+    echo ""
+    echo "  → Litmus report: $LITMUS_DIR/litmus_report.html"
+    echo "  → Probe stats:   $LITMUS_DIR/probe_stats.tsv.gz"
+    echo "  → Summary stats: $LITMUS_DIR/summary_stats.tsv"
     echo ""
 fi
 
