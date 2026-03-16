@@ -34,7 +34,7 @@ EVAL_SAMPLES = [
     "NA19347",
 ]
 
-# The 8 array samples from illumina_idat_processing (subset of EVAL_SAMPLES)
+# The 8 array samples with LRR/BAF data from illumina_idat_processing
 ARRAY_SAMPLES = [
     "HG00268",
     "HG00513",
