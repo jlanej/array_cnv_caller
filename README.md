@@ -170,6 +170,46 @@ Columns: `chrom  start  end  svtype  num_probes`
 calls when building CNV segments, reducing low-confidence edge artifacts in
 predicted DEL/DUP regions.
 
+### Litmus Test – LRR / BAF Probe Assessment
+
+The litmus test pipeline assesses how well LRR and BAF signals separate
+deletions, duplications, and copy-number neutral regions.  It reads the
+multi-sample BCF in a **single pass** (efficient for large cohorts) and
+produces an interactive Plotly dashboard, a probe-level TSV, and summary
+statistics.
+
+```bash
+python scripts/litmus_test.py \
+    --bcf multisample.bcf \
+    --truth-dir truth_sets/per_sample/ \
+    --output-dir litmus_output/
+```
+
+| Option | Description |
+|--------|-------------|
+| `--bcf` | Multi-sample BCF with `FORMAT/LRR` and `FORMAT/BAF` (required). |
+| `--truth-dir` | Directory of per-sample `<sample>.bed` truth files (required). |
+| `--output-dir` | Output directory (default: `litmus_output`). |
+| `--max-samples` | Cap the number of samples processed (default: all matched). |
+
+#### Outputs
+
+| File | Description |
+|------|-------------|
+| `litmus_report.html` | Self-contained interactive dashboard (histograms, violin plots, scatter plots, per-chromosome breakdowns, filtering panel). |
+| `probe_stats.tsv.gz` | Probe-level table (`sample, chrom, pos, lrr, baf, state, region_size`) for downstream analyses. |
+| `summary_stats.tsv` | Per-state aggregate statistics (mean, median, std, IQR, skewness, kurtosis, percentiles) for LRR and BAF. |
+
+The dashboard includes interactive filtering controls (chromosome, sample,
+minimum region size, LRR range) that dynamically regenerate histograms and
+summary tables on the fly.
+
+The litmus test can also be run as part of the full pipeline:
+
+```bash
+bash scripts/run_pipeline.sh --bcf multisample.bcf --litmus
+```
+
 ## Data Sources & Citations
 
 This project relies on the following data sources and publications:

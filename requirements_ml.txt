@@ -3,3 +3,4 @@ pysam>=0.22.0
 numpy>=1.24.0
 pandas>=2.0.0
 pytorch-crf>=0.7.2
+plotly>=5.18.0
