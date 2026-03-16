@@ -5,6 +5,7 @@
 #   1. Prepare per-sample BED truth files from the shapeit5-phased SV VCF
 #   2. Train the CNVSegmenter model on a multi-sample BCF
 #   3. (Optional) Predict CNVs for every sample in the BCF
+#   4. (Optional) Run the litmus test (LRR/BAF probe assessment dashboard)
 #
 # All prerequisite scripts and resources are pre-packed in the container
 # image published to ghcr.io/jlanej/array_cnv_caller.  On HPC clusters,
@@ -12,10 +13,11 @@
 #
 #   apptainer pull docker://ghcr.io/jlanej/array_cnv_caller:main
 #
-#   apptainer exec --nv --bind /scratch:/scratch array_cnv_caller_main.sif \
+#   apptainer exec --nv --bind $PWD array_cnv_caller_main.sif \
 #       bash /app/scripts/run_pipeline.sh \
-#       --bcf /scratch/1000g_multisample.bcf \
-#       --outdir /scratch/cnv_output
+#       --bcf $PWD/1000g_multisample.bcf \
+#       --outdir $PWD/pipeline_output \
+#       --litmus
 #
 # The script auto-detects whether it is running inside the container
 # (/app layout) or from a local repository checkout.
@@ -34,6 +36,8 @@
 #   --min-probes  Minimum probes overlapping a truth region (default: 5)
 #   --device    Device selection (default: auto)
 #   --predict   Also run prediction on every BCF sample after training
+#   --litmus    Run LRR/BAF probe assessment dashboard after training
+#   --litmus-max-samples N  Cap samples for litmus test (default: all matched)
 
 set -euo pipefail
 
