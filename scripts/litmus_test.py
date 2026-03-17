@@ -449,6 +449,55 @@ def build_dashboard(
             return data
         return data.sample(n=n, random_state=42)
 
+    def _hist_toggle_menu(title_density: str, title_count: str) -> list:
+        """Return a Plotly updatemenus list with Density / Count toggle buttons.
+
+        The active button (index 0) defaults to Density. Clicking a button
+        restyles all histogram traces and updates y-axis titles and the
+        chart title via relayout.
+        """
+        return [
+            dict(
+                type="buttons",
+                direction="left",
+                active=0,
+                pad={"r": 10, "t": 10},
+                showactive=True,
+                x=1.0, xanchor="right",
+                y=1.14, yanchor="top",
+                bgcolor="rgba(255,255,255,0.9)",
+                bordercolor="#aaaaaa",
+                borderwidth=1,
+                font=dict(size=11, family="Arial, Helvetica, sans-serif"),
+                buttons=[
+                    dict(
+                        label="Density",
+                        method="update",
+                        args=[
+                            {"histnorm": "probability density"},
+                            {
+                                "yaxis.title.text": "Probability Density",
+                                "yaxis2.title.text": "Probability Density",
+                                "title.text": title_density,
+                            },
+                        ],
+                    ),
+                    dict(
+                        label="Count",
+                        method="update",
+                        args=[
+                            {"histnorm": ""},
+                            {
+                                "yaxis.title.text": "Count",
+                                "yaxis2.title.text": "Count",
+                                "title.text": title_count,
+                            },
+                        ],
+                    ),
+                ],
+            )
+        ]
+
     # ── 1. Density histograms (LRR & BAF) ────────────────────────────
     # Using histnorm="probability density" means each state's curve
     # integrates to 1, so the rare DEL / DUP states are equally visible
@@ -500,6 +549,13 @@ def build_dashboard(
     fig_hist.update_xaxes(**_axis_style("BAF"), row=1, col=2)
     fig_hist.update_yaxes(**_axis_style("Probability Density"), row=1, col=1)
     fig_hist.update_yaxes(**_axis_style("Probability Density"), row=1, col=2)
+    # Density ↔ Count toggle (defaults to Density)
+    fig_hist.update_layout(
+        updatemenus=_hist_toggle_menu(
+            title_density="LRR & BAF Probability Density by Copy-Number State",
+            title_count="LRR & BAF Distributions by Copy-Number State",
+        )
+    )
 
     # ── 2. DEL vs DUP direct comparison (NORMAL excluded) ────────────
     # Removing the dominant NORMAL class reveals subtle shape differences
@@ -551,6 +607,13 @@ def build_dashboard(
     fig_del_dup.update_xaxes(**_axis_style("BAF"), row=1, col=2)
     fig_del_dup.update_yaxes(**_axis_style("Probability Density"), row=1, col=1)
     fig_del_dup.update_yaxes(**_axis_style("Probability Density"), row=1, col=2)
+    # Density ↔ Count toggle (defaults to Density)
+    fig_del_dup.update_layout(
+        updatemenus=_hist_toggle_menu(
+            title_density="DEL vs DUP Distribution Comparison",
+            title_count="DEL vs DUP Distribution Comparison (Counts)",
+        )
+    )
 
     # ── 3. Violin / box-plots (static overview) ───────────────────────
     # The interactive filter panel below regenerates these in real time.
@@ -1043,6 +1106,13 @@ def _filter_panel_html(df: pd.DataFrame) -> str:
         <option value="sv">DEL + DUP only</option>
       </select>
     </div>
+    <div class="filter-group">
+      <label>Histogram mode</label>
+      <select id="filt-histnorm">
+        <option value="probability density" selected>Density</option>
+        <option value="">Count</option>
+      </select>
+    </div>
     <button id="apply-btn" onclick="applyFilters()">Apply Filters</button>
   </div>
   <div id="filtered-stats"></div>
@@ -1074,6 +1144,11 @@ function applyFilters() {{
   var lrrLo     = parseFloat(document.getElementById('filt-lrr-lo').value);
   var lrrHi     = parseFloat(document.getElementById('filt-lrr-hi').value);
   var violinSts = document.getElementById('filt-violin-states').value;
+  var histNorm  = document.getElementById('filt-histnorm').value;
+  var yAxisLabel = histNorm === 'probability density' ? 'Probability Density' : 'Count';
+  var histTitle  = histNorm === 'probability density'
+    ? 'Filtered LRR &amp; BAF Probability Density by Copy-Number State'
+    : 'Filtered LRR &amp; BAF Distributions by Copy-Number State';
 
   var filtered = {{}};
   var n = _DATA.chrom.length;
@@ -1121,14 +1196,14 @@ function applyFilters() {{
       x: filtered[st].lrr, type:'histogram',
       name: st + ' (n=' + filtered[st].lrr.length.toLocaleString() + ')',
       marker:{{color:_COLOURS[st]}}, opacity:0.65, nbinsx:120,
-      histnorm:'probability density', xaxis:'x', yaxis:'y',
+      histnorm: histNorm, xaxis:'x', yaxis:'y',
       legendgroup: st
     }});
     histTraces.push({{
       x: filtered[st].baf, type:'histogram',
       name: st + ' BAF',
       marker:{{color:_COLOURS[st]}}, opacity:0.65, nbinsx:120,
-      histnorm:'probability density', xaxis:'x2', yaxis:'y2',
+      histnorm: histNorm, xaxis:'x2', yaxis:'y2',
       legendgroup: st, showlegend: false
     }});
   }});
@@ -1137,9 +1212,9 @@ function applyFilters() {{
     font: _FONT,
     grid: {{rows:1, columns:2, pattern:'independent'}},
     barmode:'overlay', height:480,
-    xaxis:  _axis('LRR'),  yaxis:  _axis('Probability Density'),
-    xaxis2: _axis('BAF'),  yaxis2: _axis('Probability Density'),
-    title: {{text:'Filtered LRR &amp; BAF Probability Density', font:{{size:15}}}},
+    xaxis:  _axis('LRR'),  yaxis:  _axis(yAxisLabel),
+    xaxis2: _axis('BAF'),  yaxis2: _axis(yAxisLabel),
+    title: {{text: histTitle, font:{{size:15}}}},
     legend: {{bgcolor:'rgba(255,255,255,0.8)', bordercolor:'#ccc', borderwidth:1}},
     margin: {{l:70, r:30, t:60, b:55}}
   }};
