@@ -1072,7 +1072,7 @@ def _filter_panel_html(df: pd.DataFrame) -> str:
 
     return f"""
 <div class="filter-panel section">
-  <h2>&#9881; Interactive Filter Panel</h2>
+  <h2>&#9881; Interactive Filtering Panel</h2>
   <p class="section-note">
     Apply any combination of filters below and click
     <strong>Apply Filters</strong> to regenerate density histograms,
