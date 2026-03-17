@@ -2,10 +2,12 @@
 # Assembly: T2T-CHM13 v2.0 (GCA_009914755.4)
 # Source: Altemose N et al. "Complete genomic and epigenetic maps of human centromeres."
 #   Science. 2022;376(6588):eabl4178. doi:10.1126/science.abl4178
-#   Table S2 — centromere alpha-satellite HOR array boundaries in CHM13v2.0.
-#   Flanking 500 kb pericentromeric buffer added to capture satellite-dense flanks.
-# Additional source: T2T Consortium cenSat annotation track
-#   URL: https://github.com/marbl/CHM13/blob/master/Supplemental/cenSat_v2.0_CHM13.bed
+#   Coordinates derived from Table S2 (active HOR array boundaries in CHM13v2.0) with
+#   ±500 kb pericentromeric flanks added to capture satellite-dense transition zones.
+# Canonical cenSat v2.0 track (direct download from T2T / Human Pangenomics S3 bucket):
+#   https://s3-us-west-2.amazonaws.com/human-pangenomics/T2T/CHM13/assemblies/annotation/chm13v2.0_censat_v2.0.bed
+# Also browseable via UCSC T2T hub:
+#   https://genome.ucsc.edu/cgi-bin/hgGateway?db=hub_3671779_GCA_009914755.4
 # Coordinates are 0-based, half-open (BED format).
 # See resources/blacklists/SOURCES.md for full citation details.
 chr1	120875000	144510000	centromere

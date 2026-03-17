@@ -1,12 +1,15 @@
 # T2T CHM13 v2.0 telomere regions (10 kb windows at each chromosome terminus)
 # Assembly: T2T-CHM13 v2.0 (GCA_009914755.4)
-# Source: Nurk S et al. "The complete sequence of a human genome."
+# Source: Computed from confirmed T2T CHM13 v2.0 contig sizes extracted directly from
+#   the FORMAT/LRR+BAF array VCF header (e.g. chr1=248,387,328; chr9=150,617,247).
+#   These match the GCA_009914755.4 assembly report at NCBI:
+#   https://www.ncbi.nlm.nih.gov/assembly/GCA_009914755.4
+#   Reference: Nurk S et al. "The complete sequence of a human genome."
 #   Science. 2022;376(6588):44-53. doi:10.1126/science.abj6987
-#   Chromosome sizes from GCA_009914755.4 assembly report; telomere annotations
-#   from T2T Consortium GitHub:
-#   URL: https://github.com/marbl/CHM13/blob/master/Supplemental/telomere_v2.0.bed
-# 10 kb windows are used as a conservative proxy; actual telomere lengths in
-# CHM13 v2.0 range from ~4 kb (chrY) to ~15 kb (chr10).
+# Canonical telomere annotation track (from T2T / Human Pangenomics S3 bucket):
+#   https://s3-us-west-2.amazonaws.com/human-pangenomics/T2T/CHM13/assemblies/annotation/chm13v2.0_telomere.bed
+# 10 kb windows are used as a conservative proxy; actual CHM13 telomere lengths range
+# from ~4 kb (chrY) to ~15 kb (chr10) as reported in Nurk et al. 2022.
 # Coordinates are 0-based, half-open (BED format).
 # See resources/blacklists/SOURCES.md for full citation details.
 chr1	0	10000	telomere

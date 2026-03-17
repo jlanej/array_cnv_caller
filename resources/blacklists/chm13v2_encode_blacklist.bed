@@ -1,15 +1,26 @@
 # T2T CHM13 v2.0 ENCODE-style blacklist — problematic regions for NGS and array assays
 # Assembly: T2T-CHM13 v2.0 (GCA_009914755.4)
-# Source: Adapted from Amemiya HM, Kundaje A, Boyle AP.
-#   "The ENCODE Blacklist: Identification of Problematic Regions of the Genome."
-#   Sci Rep. 2019;9(1):9354. doi:10.1038/s41598-019-45839-z
-#   Full T2T CHM13 blacklist: https://github.com/Boyle-Lab/Blacklist (see CHM13 release)
-# Additional source: T2T Consortium difficult-region annotations (satellite DNA,
-#   segmental duplications, low-mappability):
-#   https://github.com/marbl/CHM13/blob/master/Supplemental/
+#
+# IMPORTANT — PROVENANCE NOTE:
+#   This file is MANUALLY CURATED. As of 2024, the Boyle-Lab ENCODE Blacklist project
+#   (https://github.com/Boyle-Lab/Blacklist) does NOT have a published CHM13/T2T release.
+#   The regions here were derived by combining:
+#     (1) Centromere alpha-satellite HOR arrays — Altemose N et al. Science 2022
+#         doi:10.1126/science.abl4178; cenSat v2.0 track coordinates
+#     (2) Telomere terminal windows — computed from verified T2T CHM13 v2.0 contig sizes
+#     (3) Acrocentric short arms (chr13/14/15/21/22) — entirely satellite-rich in CHM13;
+#         these are absent from assembly gap-free regions but produce cross-hybridisation
+#         artefacts in Illumina arrays
+#     (4) chr9 pericentromeric block (q-arm heterochromatin) — historically problematic
+#         for both array and short-read alignment
+#   The ENCODE Blacklist concept (Amemiya et al. Sci Rep 2019;9:9354,
+#   doi:10.1038/s41598-019-45839-z) was used as the rationale framework.
+#
+# Reference ENCODE Blacklist (hg38 only — no CHM13 version):
+#   https://github.com/Boyle-Lab/Blacklist/raw/master/lists/hg38-blacklist.v2.bed.gz
+#
+# To use canonical T2T difficult-region annotations instead, see SOURCES.md.
 # Coordinates are 0-based, half-open (BED format).
-# Regions included: pericentromeric heterochromatin flanks, large satellite arrays
-# (HSat1-3, alphoid satellites), acrocentric short arms, and telomeres.
 # See resources/blacklists/SOURCES.md for full citation details.
 chr1	0	10000	encode_blacklist
 chr1	120875000	144510000	encode_blacklist
