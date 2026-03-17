@@ -1,0 +1,71 @@
+name: Build & Deploy Litmus Report
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_ml.txt
+
+      - name: Generate truth set
+        run: |
+          python scripts/prepare_truth_set.py \
+            --vcf tests/fixtures/test_samples.vcf.gz \
+            --output-dir litmus_build/truth_sets \
+            --min-size 1000
+
+      - name: Run litmus test and build HTML
+        run: |
+          python scripts/litmus_test.py \
+            --bcf tests/fixtures/stage2_reclustered.selected.array.samples.vcf.gz \
+            --truth-dir litmus_build/truth_sets/per_sample \
+            --output-dir litmus_build/output
+
+      - name: Prepare Pages artifact
+        run: |
+          mkdir -p _site
+          cp litmus_build/output/litmus_report.html _site/index.html
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+
+  deploy:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

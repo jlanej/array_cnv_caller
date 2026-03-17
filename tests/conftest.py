@@ -16,6 +16,9 @@ FULL_VCF = os.path.join(
     RESOURCES_DIR, "shapeit5-phased-callset_final-vcf.phased.vcf.gz"
 )
 TEST_VCF = os.path.join(FIXTURES_DIR, "test_samples.vcf.gz")
+ARRAY_VCF = os.path.join(
+    FIXTURES_DIR, "stage2_reclustered.selected.array.samples.vcf.gz"
+)
 
 # The 10 evaluation samples from Schloissnig, Pani et al.
 EVAL_SAMPLES = [
@@ -24,6 +27,18 @@ EVAL_SAMPLES = [
     "HG00731",
     "HG02554",
     "HG02953",
+    "NA12878",
+    "NA19129",
+    "NA19238",
+    "NA19331",
+    "NA19347",
+]
+
+# The 8 array samples with LRR/BAF data from illumina_idat_processing
+ARRAY_SAMPLES = [
+    "HG00268",
+    "HG00513",
+    "HG00731",
     "NA12878",
     "NA19129",
     "NA19238",
@@ -48,6 +63,12 @@ def test_vcf_path():
 def full_vcf_path():
     """Return the path to the full shapeit5-phased VCF in resources/."""
     return FULL_VCF
+
+
+@pytest.fixture
+def array_vcf_path():
+    """Return the path to the stage2 array VCF with FORMAT/LRR and FORMAT/BAF."""
+    return ARRAY_VCF
 
 
 @pytest.fixture
