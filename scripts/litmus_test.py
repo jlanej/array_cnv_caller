@@ -621,57 +621,7 @@ def build_dashboard(
         )
     )
 
-    # ── 3. Violin / box-plots (static overview) ───────────────────────
-    # The interactive filter panel below regenerates these in real time.
-    fig_violin = make_subplots(
-        rows=1,
-        cols=2,
-        subplot_titles=("LRR by State", "BAF by State"),
-        horizontal_spacing=0.10,
-    )
-    for state in STATES:
-        sub = _subsample(df[df["state"] == state])
-        colour = STATE_COLOURS[state]
-        fig_violin.add_trace(
-            go.Violin(
-                y=sub["lrr"],
-                name=state,
-                box_visible=True,
-                meanline_visible=True,
-                fillcolor=colour,
-                line_color=colour,
-                opacity=0.75,
-                legendgroup=state,
-                showlegend=True,
-                points=False,
-            ),
-            row=1, col=1,
-        )
-        fig_violin.add_trace(
-            go.Violin(
-                y=sub["baf"],
-                name=state,
-                box_visible=True,
-                meanline_visible=True,
-                fillcolor=colour,
-                line_color=colour,
-                opacity=0.75,
-                legendgroup=state,
-                showlegend=False,
-                points=False,
-            ),
-            row=1, col=2,
-        )
-    fig_violin.update_layout(
-        violinmode="group",
-        title_text="LRR &amp; BAF Violin + Box Plots by State (full dataset)",
-        height=560,
-        **_layout_defaults(),
-    )
-    fig_violin.update_yaxes(**_axis_style("LRR"), row=1, col=1)
-    fig_violin.update_yaxes(**_axis_style("BAF"), row=1, col=2)
-
-    # ── 4. 2-D scatter (LRR vs BAF) ──────────────────────────────────
+    # ── 3. 2-D scatter (LRR vs BAF) ─────────────────────────────────
     fig_scatter = go.Figure()
     # Plot NORMAL first (background) then DEL/DUP on top for visibility
     for state in ["NORMAL", "DEL", "DUP"]:
@@ -698,7 +648,7 @@ def build_dashboard(
         **_layout_defaults(),
     )
 
-    # ── 5. Per-chromosome LRR box-plots ──────────────────────────────
+    # ── 4. Per-chromosome LRR box-plots ─────────────────────────────
     # go.Box also embeds raw y-values, so cap each state to keep HTML size
     # manageable without affecting the per-chromosome quartile estimates.
     chroms = sorted(df["chrom"].unique(), key=_chrom_sort_key)
@@ -726,7 +676,7 @@ def build_dashboard(
         **_layout_defaults(),
     )
 
-    # ── 6. Region size vs mean LRR (for DEL/DUP only) ────────────────
+    # ── 5. Region size vs mean LRR (for DEL/DUP only) ───────────────
     fig_size = go.Figure()
     for state in ["DEL", "DUP"]:
         sub = df[(df["state"] == state) & (df["region_size"] > 0)]
@@ -762,7 +712,7 @@ def build_dashboard(
         **_layout_defaults(),
     )
 
-    # ── 7. Per-sample state counts ────────────────────────────────────
+    # ── 6. Per-sample state counts ───────────────────────────────────
     sample_counts = (
         df.groupby(["sample", "state"]).size().unstack(fill_value=0)
     )
@@ -787,7 +737,7 @@ def build_dashboard(
         **_layout_defaults(),
     )
 
-    # ── 8. Summary statistics table ───────────────────────────────────
+    # ── 7. Summary statistics table ──────────────────────────────────
     fmt_cols = [c for c in summary.columns if c not in ("state", "metric")]
     header_vals = ["State", "Metric"] + [c.upper() for c in fmt_cols]
     # Per-column fill colours:
@@ -838,29 +788,37 @@ def build_dashboard(
     html_parts.append(_html_header())
     html_parts.append('<div class="container">')
 
+    # About / methods description (always first)
+    html_parts.append(_about_section_html(df, summary))
+
+    # Density distributions are the key starting figure
     sections = [
-        ("Summary Statistics", fig_table),
-        ("LRR &amp; BAF Density Distributions", fig_hist),
-        ("DEL vs DUP Comparison (NORMAL excluded)", fig_del_dup),
-        ("LRR vs BAF Scatter", fig_scatter),
-        ("Per-Chromosome LRR", fig_chrom),
-        ("Region Size vs Mean LRR", fig_size),
-        ("Per-Sample Probe Counts", fig_samples),
+        (
+            "LRR &amp; BAF Density Distributions",
+            fig_hist,
+            "Primary diagnostic figure: each copy-number state is normalised to "
+            "unit area so rare DEL and DUP populations are directly comparable to "
+            "the dominant NORMAL class. Toggle between Density and Count modes "
+            "using the button in the top-right corner of the plot.",
+        ),
+        (
+            "DEL vs DUP Comparison (NORMAL excluded)",
+            fig_del_dup,
+            "Direct comparison of deletion and duplication signal shapes with the "
+            "dominant NORMAL class removed, revealing subtle distribution "
+            "differences at the same density scale.",
+        ),
+        ("Summary Statistics", fig_table, None),
+        ("LRR vs BAF Scatter", fig_scatter, None),
+        ("Per-Chromosome LRR", fig_chrom, None),
+        ("Region Size vs Mean LRR", fig_size, None),
+        ("Per-Sample Probe Counts", fig_samples, None),
     ]
 
-    # Static violin section with a note pointing to the interactive panel
-    html_parts.append('<div class="section">')
-    html_parts.append('<h2>Violin &amp; Box Plots (full dataset)</h2>')
-    html_parts.append(
-        '<p class="section-note">The interactive filter panel below '
-        'allows you to regenerate violin plots for any chromosome, sample '
-        'and region-size subset in real time.</p>'
-    )
-    html_parts.append(fig_violin.to_html(full_html=False, include_plotlyjs=False))
-    html_parts.append("</div>")
-
-    for title, fig in sections:
+    for title, fig, note in sections:
         html_parts.append(f'<div class="section"><h2>{title}</h2>')
+        if note:
+            html_parts.append(f'<p class="section-note">{note}</p>')
         html_parts.append(
             fig.to_html(full_html=False, include_plotlyjs=False)
         )
@@ -875,6 +833,187 @@ def build_dashboard(
     with open(output_path, "w") as fh:
         fh.write("\n".join(html_parts))
     LOG.info("Dashboard written to %s", output_path)
+
+
+def _about_section_html(df: pd.DataFrame, summary: pd.DataFrame) -> str:
+    """Generate the 'About This Report' section with data sources and methods.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Probe-level table; used to derive sample list and state counts.
+    summary : pd.DataFrame
+        Aggregate stats from :func:`compute_summary_stats`; used to show
+        per-state LRR summary statistics inline.
+    """
+    samples = sorted(df["sample"].unique().tolist())
+    n_samples = len(samples)
+    state_counts = df["state"].value_counts()
+    n_total = len(df)
+
+    sample_badges = " ".join(
+        f'<span class="sample-badge">{s}</span>' for s in samples
+    )
+
+    # Per-state LRR stats from summary DataFrame
+    lrr_rows: list[dict] = []
+    for _, row in summary.iterrows():
+        if row["metric"] == "lrr":
+            lrr_rows.append(row.to_dict())
+
+    def _stat_row(state: str) -> str:
+        matches = [r for r in lrr_rows if r["state"] == state]
+        if not matches:
+            return ""
+        s = matches[0]
+        n_probes = int(state_counts.get(state, 0))
+        return (
+            f'<tr><td><span class="badge-{state}">{state}</span></td>'
+            f'<td>{n_probes:,}</td>'
+            f'<td>{s.get("mean", 0):.3f}</td>'
+            f'<td>{s.get("median", 0):.3f}</td>'
+            f'<td>{s.get("std", 0):.3f}</td>'
+            f'<td>{s.get("iqr", 0):.3f}</td></tr>'
+        )
+
+    stat_rows = "".join(_stat_row(st) for st in ["DEL", "NORMAL", "DUP"])
+
+    return f"""
+<div class="section about-section">
+  <h2>About This Report</h2>
+  <div class="about-grid">
+
+    <div class="about-block">
+      <h3>What Are We Looking At?</h3>
+      <p>This interactive dashboard is a quality-control (&ldquo;litmus test&rdquo;)
+      assessment of Illumina microarray probe signals across three copy-number states:
+      <span class="badge-DEL">DEL</span>&nbsp;(deletion),
+      <span class="badge-NORMAL">NORMAL</span>&nbsp;(diploid), and
+      <span class="badge-DUP">DUP</span>&nbsp;(duplication). It validates that the
+      two key signal channels &mdash; <strong>LRR</strong> and <strong>BAF</strong>
+      &mdash; are discriminative across copy-number states and that the truth-set
+      labels used to train the <em>array_cnv_caller</em> ML model are
+      well-calibrated.</p>
+      <p>The <strong>LRR &amp; BAF Density Distributions</strong> immediately below
+      are the primary diagnostic figure: clearly separated peaks across states
+      indicate that the array signals are suitable for machine-learning-based
+      CNV calling.</p>
+    </div>
+
+    <div class="about-block">
+      <h3>Signal Types</h3>
+      <dl class="signal-dl">
+        <dt>LRR &mdash; Log R Ratio</dt>
+        <dd>Normalised probe intensity relative to the expected diploid signal.
+        <strong>Deletions</strong> shift LRR negative (&lt;&thinsp;0);
+        <strong>duplications</strong> shift it positive (&gt;&thinsp;0);
+        diploid probes cluster near&nbsp;0. LRR is the primary copy-number
+        signal.</dd>
+        <dt>BAF &mdash; B-Allele Frequency</dt>
+        <dd>Allelic balance at heterozygous SNP probe positions (range
+        0&ndash;1). Diploid heterozygous probes cluster at&nbsp;0.5.
+        <strong>Deletions</strong> cause BAF to shift toward 0 or 1 (loss of
+        heterozygosity); <strong>duplications</strong> create additional
+        clusters near &asymp;&thinsp;0.33 and 0.67. BAF provides complementary
+        phase information to LRR.</dd>
+      </dl>
+    </div>
+
+    <div class="about-block">
+      <h3>Data Sources</h3>
+      <ul class="about-list">
+        <li><strong>Array probe data:</strong> Multi-sample BCF
+        (<code>stage2_reclustered.selected.array.samples.vcf.gz</code>) with
+        per-probe <code>FORMAT/LRR</code> and <code>FORMAT/BAF</code> fields.
+        Contains {n_total:,}&nbsp;labelled probe observations across
+        {n_samples}&nbsp;sample{'s' if n_samples != 1 else ''}.</li>
+        <li><strong>Structural variant truth set:</strong> DEL/DUP calls from
+        the <em>shapeit5</em>-phased 1000&nbsp;Genomes ONT Vienna callset
+        (variants &ge;&thinsp;1,000&nbsp;bp retained). Each probe overlapping
+        a truth interval is labelled DEL or DUP; all remaining probes are
+        labelled NORMAL.</li>
+        <li><strong>Primary citation:</strong> Schloissnig&nbsp;S &amp;
+        Pani&nbsp;S. <em>Long-read sequencing and structural variant
+        characterization in 1,019 samples from the 1000 Genomes
+        Project.</em> <em>bioRxiv</em> (2024).
+        <a href="https://doi.org/10.1101/2024.04.18.590093"
+           target="_blank" rel="noopener noreferrer">
+           doi:10.1101/2024.04.18.590093</a></li>
+      </ul>
+    </div>
+
+    <div class="about-block">
+      <h3>Samples ({n_samples})</h3>
+      <div class="sample-list">{sample_badges}</div>
+      <p style="margin:10px 0 6px;font-size:13px;color:#555;">
+        LRR summary statistics per copy-number state:
+      </p>
+      <table class="stats-table">
+        <thead><tr>
+          <th>State</th><th>Probes</th>
+          <th>LRR mean</th><th>LRR median</th><th>LRR std</th><th>LRR IQR</th>
+        </tr></thead>
+        <tbody>{stat_rows}</tbody>
+      </table>
+      <p class="section-note" style="margin-top:8px;">
+        Full per-state statistics (BAF, skewness, kurtosis, percentiles) are
+        available in the Summary Statistics section below.
+      </p>
+    </div>
+
+    <div class="about-block">
+      <h3>Methods</h3>
+      <ol class="about-list">
+        <li><strong>Truth preparation:</strong> Per-sample BED files are
+        derived from the shapeit5-phased SV callset using
+        <code>prepare_truth_set.py</code>. Only DEL and DUP variants
+        &ge;&thinsp;1,000&nbsp;bp are retained. Probes outside any truth
+        interval are labelled NORMAL.</li>
+        <li><strong>Probe labelling:</strong> For each BCF record the probe
+        position is classified against pre-loaded, sorted truth intervals via
+        binary search (O(log&thinsp;N) per probe). A single BCF pass processes
+        all samples simultaneously, keeping I/O at O(records).</li>
+        <li><strong>Density normalisation:</strong> Histograms use
+        <em>probability density</em> normalisation so each state integrates to
+        1.0, placing the rare DEL/DUP classes on an equal visual footing with
+        the dominant NORMAL class regardless of imbalanced probe counts.</li>
+        <li><strong>Subsampling:</strong> States with &gt;200,000 probes are
+        randomly subsampled for rendering performance; full population counts
+        are shown in legend labels and the statistics table.</li>
+      </ol>
+    </div>
+
+    <div class="about-block">
+      <h3>Plot Guide</h3>
+      <ul class="about-list">
+        <li><strong>LRR &amp; BAF Density Distributions</strong> &mdash;
+        <em>Primary figure.</em> Probability density per state for both signal
+        channels. Toggle between Density and Count with the button in the
+        top-right corner.</li>
+        <li><strong>DEL vs DUP Comparison</strong> &mdash; Distributions for
+        deletions and duplications only; NORMAL excluded so subtle shape
+        differences are visible at the same scale.</li>
+        <li><strong>Summary Statistics</strong> &mdash; Mean, median, SD, IQR,
+        skewness, kurtosis, and percentiles per state and signal channel.</li>
+        <li><strong>LRR vs BAF Scatter</strong> &mdash; 2-D joint distribution
+        coloured by copy-number state (sub-sampled for rendering speed).</li>
+        <li><strong>Per-Chromosome LRR</strong> &mdash; Box plots per
+        chromosome; useful for detecting chromosomal-scale technical
+        artefacts.</li>
+        <li><strong>Region Size vs Mean LRR</strong> &mdash; Signal strength
+        as a function of SV size. Larger SVs typically produce stronger LRR
+        deviation.</li>
+        <li><strong>Per-Sample Probe Counts</strong> &mdash; Stacked bar chart
+        of probe counts by copy-number state for each sample; highlights
+        sample-level imbalances in truth-set coverage.</li>
+        <li><strong>Interactive Filter Panel</strong> &mdash; Filter by
+        chromosome, sample, minimum region size, and LRR range; density
+        histograms and violin plots regenerate in real time.</li>
+      </ul>
+    </div>
+
+  </div>
+</div>"""
 
 
 def _html_header() -> str:
@@ -925,6 +1064,59 @@ def _html_header() -> str:
     padding: 24px 28px;
     margin-bottom: 24px;
     border: 1px solid #e8eaed;
+  }
+  /* ── About section ── */
+  .about-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+    gap: 20px;
+    margin-top: 16px;
+  }
+  .about-block {
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 16px 18px;
+  }
+  .about-block h3 {
+    margin: 0 0 10px;
+    font-size: 14px;
+    font-weight: 700;
+    color: #1a3a5c;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+  }
+  .about-block p, .about-block li, .about-block dd {
+    font-size: 13px;
+    color: #3a3a3a;
+    line-height: 1.6;
+    margin: 0 0 6px;
+  }
+  .about-list { padding-left: 18px; margin: 0; }
+  .about-list li { margin-bottom: 7px; }
+  .signal-dl dt {
+    font-weight: 700;
+    font-size: 13px;
+    color: #1a3a5c;
+    margin-top: 10px;
+  }
+  .signal-dl dt:first-child { margin-top: 0; }
+  .signal-dl dd { margin: 2px 0 0 0; padding-left: 12px; }
+  .sample-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 4px;
+  }
+  .sample-badge {
+    background: #e8f0fb;
+    border: 1px solid #b0c4de;
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 12px;
+    font-family: monospace;
+    color: #1a3a5c;
+    font-weight: 600;
   }
   h2 {
     margin-top: 0;
@@ -1029,8 +1221,11 @@ def _html_header() -> str:
 <div class="container">
 <div class="report-header">
   <h1>Litmus Test &ndash; LRR / BAF Probe-Level Assessment</h1>
-  <p>Interactive quality dashboard for array probe signals across
-     copy-number states (DEL / NORMAL / DUP)</p>
+  <p>Quality-control dashboard for array probe signals across copy-number states
+     (DEL / NORMAL / DUP) &mdash; generated by
+     <a href="https://github.com/jlanej/array_cnv_caller"
+        style="color:#aed6f1;" target="_blank" rel="noopener noreferrer">
+        array_cnv_caller</a></p>
 </div>
 </div>
 """
