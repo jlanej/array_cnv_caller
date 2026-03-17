@@ -14,16 +14,21 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), os.pardir, "scripts"))
 
 from litmus_test import (
+    BLACKLIST_NONE,
     CLASS_DEL,
     CLASS_DUP,
     CLASS_NAMES,
     CLASS_NORMAL,
+    annotate_probes_with_blacklist,
+    build_blacklist_summary,
     build_dashboard,
     build_parser,
     classify_probe,
+    classify_probe_blacklist,
     collect_probe_data,
     compute_summary_stats,
     label_probes,
+    load_blacklist_regions,
     load_truth_intervals,
     match_samples,
 )
@@ -382,3 +387,265 @@ class TestBuildParser:
         parser = build_parser()
         with pytest.raises(SystemExit):
             parser.parse_args([])
+
+    def test_blacklist_dir_default(self):
+        """--blacklist-dir defaults to the repo resources/blacklists/ directory."""
+        parser = build_parser()
+        args = parser.parse_args(["--bcf", "test.bcf", "--truth-dir", "beds/"])
+        assert "blacklists" in args.blacklist_dir
+
+    def test_blacklist_dir_custom(self):
+        parser = build_parser()
+        args = parser.parse_args([
+            "--bcf", "test.bcf",
+            "--truth-dir", "beds/",
+            "--blacklist-dir", "/tmp/my_bl/",
+        ])
+        assert args.blacklist_dir == "/tmp/my_bl/"
+
+    def test_blacklist_dir_empty_disables(self):
+        """Passing --blacklist-dir '' allows disabling blacklist annotation."""
+        parser = build_parser()
+        args = parser.parse_args([
+            "--bcf", "test.bcf",
+            "--truth-dir", "beds/",
+            "--blacklist-dir", "",
+        ])
+        assert args.blacklist_dir == ""
+
+
+# ── load_blacklist_regions ────────────────────────────────────────────
+class TestLoadBlacklistRegions:
+    """Tests for load_blacklist_regions()."""
+
+    @pytest.fixture
+    def blacklist_dir(self, tmp_path):
+        """Create a minimal blacklist directory with two BED files."""
+        (tmp_path / "centromeres.bed").write_text(
+            "# comment\n"
+            "chr1\t100\t200\tcentromere\n"
+            "chr2\t500\t1000\tcentromere\n"
+        )
+        (tmp_path / "telomeres.bed").write_text(
+            "chr1\t0\t50\ttelomere\n"
+            "chr1\t9950\t10000\ttelomere\n"
+        )
+        return str(tmp_path)
+
+    def test_loads_both_tracks(self, blacklist_dir):
+        bl = load_blacklist_regions(blacklist_dir)
+        assert "centromeres" in bl
+        assert "telomeres" in bl
+
+    def test_skips_non_bed_files(self, tmp_path):
+        (tmp_path / "SOURCES.md").write_text("# sources")
+        (tmp_path / "regions.bed").write_text("chr1\t0\t100\tfoo\n")
+        bl = load_blacklist_regions(str(tmp_path))
+        assert "regions" in bl
+        assert "SOURCES" not in bl
+
+    def test_skips_comment_lines(self, blacklist_dir):
+        bl = load_blacklist_regions(blacklist_dir)
+        starts = bl["centromeres"]["chr1"][0]
+        assert len(starts) == 1  # only one chr1 entry (comment skipped)
+
+    def test_sorted_starts(self, blacklist_dir):
+        bl = load_blacklist_regions(blacklist_dir)
+        starts = bl["telomeres"]["chr1"][0]
+        assert list(starts) == sorted(starts)
+
+    def test_empty_dir(self, tmp_path):
+        bl = load_blacklist_regions(str(tmp_path))
+        assert bl == {}
+
+    def test_missing_dir(self):
+        bl = load_blacklist_regions("/nonexistent/path/")
+        assert bl == {}
+
+    def test_arrays_dtype(self, blacklist_dir):
+        bl = load_blacklist_regions(blacklist_dir)
+        starts, ends, idxs = bl["centromeres"]["chr1"]
+        assert starts.dtype == np.int64
+        assert ends.dtype == np.int64
+        assert idxs.dtype == np.int64
+
+
+# ── classify_probe_blacklist ──────────────────────────────────────────
+class TestClassifyProbeBlacklist:
+    """Tests for classify_probe_blacklist()."""
+
+    @pytest.fixture
+    def blacklist(self, tmp_path):
+        (tmp_path / "centromeres.bed").write_text("chr1\t100\t200\tcentromere\n")
+        (tmp_path / "telomeres.bed").write_text("chr1\t0\t50\ttelomere\n")
+        return load_blacklist_regions(str(tmp_path))
+
+    def test_probe_in_centromere(self, blacklist):
+        assert classify_probe_blacklist(blacklist, "chr1", 150) == "centromeres"
+
+    def test_probe_in_telomere(self, blacklist):
+        assert classify_probe_blacklist(blacklist, "chr1", 10) == "telomeres"
+
+    def test_probe_outside_all(self, blacklist):
+        assert classify_probe_blacklist(blacklist, "chr1", 300) == BLACKLIST_NONE
+
+    def test_unknown_chrom(self, blacklist):
+        assert classify_probe_blacklist(blacklist, "chrZ", 100) == BLACKLIST_NONE
+
+    def test_empty_blacklist(self):
+        assert classify_probe_blacklist({}, "chr1", 100) == BLACKLIST_NONE
+
+    def test_boundary_start_inclusive(self, blacklist):
+        # centromere starts at 100
+        assert classify_probe_blacklist(blacklist, "chr1", 100) == "centromeres"
+
+    def test_boundary_end_exclusive(self, blacklist):
+        # centromere ends at 200 (exclusive)
+        assert classify_probe_blacklist(blacklist, "chr1", 200) == BLACKLIST_NONE
+
+
+# ── annotate_probes_with_blacklist ────────────────────────────────────
+class TestAnnotateProbesWithBlacklist:
+    """Tests for annotate_probes_with_blacklist()."""
+
+    @pytest.fixture
+    def simple_df(self):
+        return pd.DataFrame({
+            "chrom": ["chr1", "chr1", "chr1"],
+            "pos":   [10, 150, 300],
+            "lrr":   [0.0, -0.5, 0.1],
+            "baf":   [0.5, 0.1, 0.5],
+        })
+
+    @pytest.fixture
+    def bl_dir(self, tmp_path):
+        (tmp_path / "centromeres.bed").write_text("chr1\t100\t200\tcentromere\n")
+        (tmp_path / "telomeres.bed").write_text("chr1\t0\t50\ttelomere\n")
+        return str(tmp_path)
+
+    def test_adds_blacklist_region_column(self, simple_df, bl_dir):
+        result = annotate_probes_with_blacklist(simple_df, bl_dir)
+        assert "blacklist_region" in result.columns
+
+    def test_correct_labels(self, simple_df, bl_dir):
+        result = annotate_probes_with_blacklist(simple_df, bl_dir)
+        assert result.iloc[0]["blacklist_region"] == "telomeres"
+        assert result.iloc[1]["blacklist_region"] == "centromeres"
+        assert result.iloc[2]["blacklist_region"] == BLACKLIST_NONE
+
+    def test_empty_blacklist_dir(self, simple_df, tmp_path):
+        result = annotate_probes_with_blacklist(simple_df, str(tmp_path))
+        assert all(v == BLACKLIST_NONE for v in result["blacklist_region"])
+
+    def test_missing_dir(self, simple_df, tmp_path):
+        result = annotate_probes_with_blacklist(simple_df, "/nonexistent/")
+        assert all(v == BLACKLIST_NONE for v in result["blacklist_region"])
+
+
+# ── build_blacklist_summary ───────────────────────────────────────────
+class TestBuildBlacklistSummary:
+    """Tests for build_blacklist_summary()."""
+
+    @pytest.fixture
+    def df_with_bl(self):
+        return pd.DataFrame({
+            "state": ["DEL"] * 30 + ["NORMAL"] * 60 + ["DUP"] * 10,
+            "blacklist_region": (
+                ["centromeres"] * 10 + [""] * 20
+                + [""] * 60
+                + ["telomeres"] * 10
+            ),
+        })
+
+    def test_returns_dataframe(self, df_with_bl):
+        result = build_blacklist_summary(df_with_bl)
+        assert isinstance(result, pd.DataFrame)
+
+    def test_expected_columns(self, df_with_bl):
+        result = build_blacklist_summary(df_with_bl)
+        assert set(result.columns) == {"blacklist_region", "state", "n_probes", "pct_of_state"}
+
+    def test_none_region_labelled(self, df_with_bl):
+        result = build_blacklist_summary(df_with_bl)
+        regions = set(result["blacklist_region"])
+        assert "(none)" in regions
+
+    def test_centromere_region_present(self, df_with_bl):
+        result = build_blacklist_summary(df_with_bl)
+        assert "centromeres" in set(result["blacklist_region"])
+
+    def test_pct_calculation(self, df_with_bl):
+        result = build_blacklist_summary(df_with_bl)
+        cen_del = result[
+            (result["blacklist_region"] == "centromeres") & (result["state"] == "DEL")
+        ]
+        assert not cen_del.empty
+        # 10 centromere DEL out of 30 total DEL = 33.33%
+        assert abs(cen_del.iloc[0]["pct_of_state"] - 33.33) < 0.5
+
+    def test_no_blacklist_column(self):
+        df = pd.DataFrame({"state": ["DEL", "NORMAL"], "lrr": [0.0, 0.1]})
+        result = build_blacklist_summary(df)
+        assert result.empty
+
+    def test_counts_correct(self, df_with_bl):
+        result = build_blacklist_summary(df_with_bl)
+        cen_del = result[
+            (result["blacklist_region"] == "centromeres") & (result["state"] == "DEL")
+        ]
+        assert cen_del.iloc[0]["n_probes"] == 10
+
+
+# ── build_dashboard (blacklist integration) ───────────────────────────
+class TestBuildDashboardBlacklist:
+    """Tests for build_dashboard() when blacklist_region column is present."""
+
+    @pytest.fixture
+    def probe_stats_with_bl(self, probe_stats_df):
+        np.random.seed(7)
+        n = len(probe_stats_df)
+        # Assign ~15% of probes to blacklist regions to exercise the summary table
+        regions = np.where(
+            np.random.rand(n) < 0.15,
+            np.random.choice(["centromeres", "telomeres"], size=n),
+            "",
+        )
+        probe_stats_df = probe_stats_df.copy()
+        probe_stats_df["blacklist_region"] = regions
+        return probe_stats_df
+
+    def test_html_contains_blacklist_section(self, probe_stats_with_bl, tmp_path):
+        summary = compute_summary_stats(probe_stats_with_bl)
+        out = str(tmp_path / "test_bl.html")
+        build_dashboard(
+            probe_stats_with_bl, summary, out,
+            blacklist_dir="/tmp/mock_bl/"  # dir absent; section still shown
+        )
+        with open(out) as f:
+            content = f.read()
+        assert "Blacklist Region Summary" in content
+
+    def test_html_contains_t2t_reference(self, probe_stats_with_bl, tmp_path):
+        summary = compute_summary_stats(probe_stats_with_bl)
+        out = str(tmp_path / "test_t2t.html")
+        build_dashboard(probe_stats_with_bl, summary, out)
+        with open(out) as f:
+            content = f.read()
+        assert "T2T" in content
+
+    def test_html_blacklist_filter_option(self, probe_stats_with_bl, tmp_path):
+        summary = compute_summary_stats(probe_stats_with_bl)
+        out = str(tmp_path / "test_bl_filter.html")
+        build_dashboard(probe_stats_with_bl, summary, out)
+        with open(out) as f:
+            content = f.read()
+        assert "Exclude blacklist" in content
+        assert "Show only blacklist" in content
+
+    def test_html_no_blacklist_column(self, probe_stats_df, tmp_path):
+        """Dashboard should render without error even without blacklist_region col."""
+        summary = compute_summary_stats(probe_stats_df)
+        out = str(tmp_path / "test_no_bl.html")
+        build_dashboard(probe_stats_df, summary, out)
+        assert os.path.isfile(out)
+

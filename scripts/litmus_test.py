@@ -7,20 +7,26 @@ per-sample truth-set BED files, labels every probe as DEL / NORMAL / DUP,
 and produces:
 
 1. **probe_stats.tsv.gz**  – probe-level table (sample, chrom, pos, lrr,
-   baf, state, region_size) for downstream analyses.
+   baf, state, region_size, blacklist_region) for downstream analyses.
 2. **summary_stats.tsv**   – per-state aggregate statistics (mean, median,
    std, IQR, skewness, kurtosis, N) for LRR and BAF.
 3. **litmus_report.html**  – self-contained interactive Plotly dashboard
    with histograms, violin/box-plots, 2-D scatter, and per-chromosome
    break-downs.  Drop-down menus and sliders allow real-time filtering by
-   chromosome, sample, SV-region size, and LRR/BAF ranges.
+   chromosome, sample, SV-region size, LRR/BAF ranges, and blacklist region
+   type (centromere / telomere / ENCODE blacklist / custom).
 
 CLI
 ~~~
     python scripts/litmus_test.py \\
         --bcf multi.bcf \\
         --truth-dir truth_sets/per_sample/ \\
-        --output-dir litmus_output/
+        --output-dir litmus_output/ \\
+        --blacklist-dir resources/blacklists/
+
+Blacklist BED files in ``resources/blacklists/`` are packaged with the repo
+and document known problematic regions (centromeres, telomeres, ENCODE
+blacklist v2).  See ``resources/blacklists/SOURCES.md`` for full citations.
 
 The script reuses the BCF-reading and labelling conventions established
 in ``ml_cnv_calling.py`` (half-open BED intervals, DEL=0 / NORMAL=1 /
@@ -200,7 +206,217 @@ def label_probes(
 
 
 # ===================================================================
-# Statistics
+# Blacklist region helpers
+# ===================================================================
+
+#: Sentinel value used in the probe table when a probe is not in any
+#: known problematic region.
+BLACKLIST_NONE = ""
+
+#: Directory within the repository that ships with pre-packaged BED files.
+_REPO_BLACKLIST_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "resources", "blacklists",
+)
+
+
+def load_blacklist_regions(
+    blacklist_dir: str,
+) -> Dict[str, Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]]]:
+    """Load all ``.bed`` files in *blacklist_dir* into sorted interval arrays.
+
+    Each BED file's stem (filename without the ``.bed`` suffix) is used as the
+    region-type label (e.g. ``chm13v2_centromeres.bed`` →
+    ``"chm13v2_centromeres"``).
+    Lines beginning with ``#`` are treated as comments and ignored.
+
+    Parameters
+    ----------
+    blacklist_dir : str
+        Directory containing ``.bed`` files.  Files without a ``.bed`` suffix
+        are silently skipped.
+
+    Returns
+    -------
+    dict
+        Mapping ``region_type → chrom → (starts, ends, indices)`` where
+        *starts* and *ends* are sorted ``np.int64`` arrays and *indices* is
+        an array of integer indices into a per-region-type label list (always
+        all zeros here; kept for API symmetry with
+        :func:`load_truth_intervals`).
+    """
+    blacklist: Dict[str, Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]]] = {}
+    if not os.path.isdir(blacklist_dir):
+        LOG.warning("Blacklist directory not found: %s — skipping.", blacklist_dir)
+        return blacklist
+
+    for fname in sorted(os.listdir(blacklist_dir)):
+        if not fname.endswith(".bed"):
+            continue
+        region_type = fname[:-4]  # strip .bed
+        bed_path = os.path.join(blacklist_dir, fname)
+        rows: list[dict] = []
+        with open(bed_path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 3:
+                    continue
+                try:
+                    rows.append(
+                        {"chrom": parts[0], "start": int(parts[1]), "end": int(parts[2])}
+                    )
+                except ValueError:
+                    continue
+
+        if not rows:
+            LOG.warning("Blacklist file %s has no usable rows — skipping.", fname)
+            continue
+
+        chrom_map: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        import pandas as _pd
+        bl_df = _pd.DataFrame(rows)
+        for chrom, grp in bl_df.groupby("chrom"):
+            grp = grp.sort_values("start")
+            starts = grp["start"].values.astype(np.int64)
+            ends = grp["end"].values.astype(np.int64)
+            indices = np.zeros(len(starts), dtype=np.int64)
+            chrom_map[chrom] = (starts, ends, indices)
+        blacklist[region_type] = chrom_map
+        LOG.debug(
+            "Loaded blacklist '%s': %d chromosomes, %d total regions.",
+            region_type,
+            len(chrom_map),
+            sum(len(v[0]) for v in chrom_map.values()),
+        )
+
+    LOG.info(
+        "Loaded %d blacklist track(s) from %s: %s",
+        len(blacklist),
+        blacklist_dir,
+        list(blacklist.keys()),
+    )
+    return blacklist
+
+
+def classify_probe_blacklist(
+    blacklist: Dict[str, Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]]],
+    chrom: str,
+    pos: int,
+) -> str:
+    """Return the first blacklist region type that contains *pos*, or ``""``.
+
+    Region types are checked in sorted order (alphabetical by BED filename
+    stem).  If a probe falls in multiple overlapping blacklist tracks the
+    first match is returned.
+
+    Parameters
+    ----------
+    blacklist : dict
+        Nested mapping returned by :func:`load_blacklist_regions`.
+    chrom : str
+        Chromosome of the probe.
+    pos : int
+        Genomic position of the probe (1-based VCF convention).
+
+    Returns
+    -------
+    str
+        Region-type label (e.g. ``"chm13v2_centromeres"``), or ``""`` if the
+        probe does not overlap any blacklist region.
+    """
+    for region_type, chrom_map in sorted(blacklist.items()):
+        chrom_ivls = chrom_map.get(chrom)
+        if chrom_ivls is None:
+            continue
+        starts, ends, _ = chrom_ivls
+        idx = int(np.searchsorted(starts, pos, side="right")) - 1
+        while idx >= 0:
+            if starts[idx] > pos:
+                idx -= 1
+                continue
+            if pos < ends[idx]:
+                return region_type
+            if idx > 0 and starts[idx - 1] == starts[idx]:
+                idx -= 1
+                continue
+            break
+    return BLACKLIST_NONE
+
+
+def annotate_probes_with_blacklist(
+    df: "pd.DataFrame",
+    blacklist_dir: str,
+) -> "pd.DataFrame":
+    """Add a ``blacklist_region`` column to *df* in place.
+
+    Each probe is classified against all BED files in *blacklist_dir*.  The
+    resulting column contains the region-type label (BED filename stem) for
+    the first matching region, or an empty string for probes outside all
+    blacklist tracks.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Probe-level table with at least ``chrom`` and ``pos`` columns.
+    blacklist_dir : str
+        Directory of ``.bed`` blacklist files.
+
+    Returns
+    -------
+    pd.DataFrame
+        The same DataFrame with a new ``blacklist_region`` column added.
+    """
+    blacklist = load_blacklist_regions(blacklist_dir)
+    if not blacklist:
+        df["blacklist_region"] = BLACKLIST_NONE
+        return df
+
+    df["blacklist_region"] = df.apply(
+        lambda row: classify_probe_blacklist(blacklist, row["chrom"], row["pos"]),
+        axis=1,
+    )
+    return df
+
+
+def build_blacklist_summary(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Summarise probe and SV-call counts per blacklist region type and state.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Probe-level table with ``blacklist_region`` and ``state`` columns.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: ``blacklist_region``, ``state``, ``n_probes``,
+        ``pct_of_state``.  One row per (region, state) combination.
+    """
+    if "blacklist_region" not in df.columns:
+        return pd.DataFrame(
+            columns=["blacklist_region", "state", "n_probes", "pct_of_state"]
+        )
+
+    state_totals = df["state"].value_counts()
+    rows: list[dict] = []
+    for region, grp in df.groupby("blacklist_region", sort=True):
+        for state, sub in grp.groupby("state"):
+            n = len(sub)
+            total = state_totals.get(state, 1)
+            rows.append(
+                {
+                    "blacklist_region": region if region else "(none)",
+                    "state": state,
+                    "n_probes": n,
+                    "pct_of_state": round(100.0 * n / total, 2),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 # ===================================================================
 def compute_summary_stats(df: pd.DataFrame) -> pd.DataFrame:
     """Compute per-state aggregate statistics for LRR and BAF.
@@ -252,6 +468,7 @@ def collect_probe_data(
     bcf_path: str,
     truth_dir: str,
     max_samples: Optional[int] = None,
+    blacklist_dir: Optional[str] = None,
 ) -> pd.DataFrame:
     """Read probes across matched samples in a **single BCF pass**.
 
@@ -269,11 +486,16 @@ def collect_probe_data(
         Directory containing ``<sample>.bed`` truth files.
     max_samples : int, optional
         Cap the number of samples processed (useful for quick checks).
+    blacklist_dir : str, optional
+        Directory of ``.bed`` blacklist files (centromeres, telomeres, etc.)
+        used to annotate each probe with a ``blacklist_region`` label.
+        When *None* the column is added with every row set to ``""``.
 
     Returns
     -------
     pd.DataFrame
-        Columns: sample, chrom, pos, lrr, baf, state, region_size.
+        Columns: sample, chrom, pos, lrr, baf, state, region_size,
+        blacklist_region.
     """
     matched, bcf_only, truth_only = match_samples(bcf_path, truth_dir)
     LOG.info(
@@ -295,6 +517,11 @@ def collect_probe_data(
     LOG.info("Pre-loading truth intervals for %d samples …", len(matched))
     all_intervals = load_truth_intervals(truth_dir, matched)
 
+    # ── Pre-load blacklist intervals (if provided) ────────────────────
+    blacklist: Dict[str, Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]]] = {}
+    if blacklist_dir:
+        blacklist = load_blacklist_regions(blacklist_dir)
+
     # ── Single pass through the BCF ──────────────────────────────────
     LOG.info("Starting single-pass BCF scan …")
     vcf = pysam.VariantFile(bcf_path)
@@ -307,6 +534,7 @@ def collect_probe_data(
     col_baf: list[float] = []
     col_state: list[str] = []
     col_region_size: list[int] = []
+    col_blacklist: list[str] = []
     samples_seen: set[str] = set()
 
     n_records = 0
@@ -316,6 +544,12 @@ def collect_probe_data(
         n_records += 1
         if n_records % 100_000 == 0:
             LOG.info("  … %d BCF records scanned", n_records)
+
+        # Classify blacklist region once per position (shared across samples)
+        bl_region = (
+            classify_probe_blacklist(blacklist, chrom, pos)
+            if blacklist else BLACKLIST_NONE
+        )
 
         for sample in matched:
             fmt = rec.samples[sample]
@@ -335,6 +569,7 @@ def collect_probe_data(
             col_baf.append(float(baf))
             col_state.append(CLASS_NAMES[cls])
             col_region_size.append(region_size)
+            col_blacklist.append(bl_region)
             samples_seen.add(sample)
 
     vcf.close()
@@ -357,6 +592,7 @@ def collect_probe_data(
             "baf": col_baf,
             "state": col_state,
             "region_size": col_region_size,
+            "blacklist_region": col_blacklist,
         }
     )
     LOG.info(
@@ -377,6 +613,7 @@ def build_dashboard(
     *,
     bcf_path: Optional[str] = None,
     truth_dir: Optional[str] = None,
+    blacklist_dir: Optional[str] = None,
 ) -> None:
     """Generate a self-contained interactive HTML dashboard.
 
@@ -390,13 +627,18 @@ def build_dashboard(
     * 2-D LRR×BAF scatter coloured by state (sub-sampled for speed)
     * Per-chromosome LRR distributions
     * Summary statistics table
+    * **Blacklist region summary** — probe and SV-call counts per problematic
+      region type (centromere, telomere, ENCODE blacklist, etc.) with a
+      stacked bar chart visualisation
     * Interactive filter panel that regenerates histograms **and** violin plots
-      in real time (chromosome, sample, region-size, and LRR-range filters)
+      in real time (chromosome, sample, region-size, LRR-range, and blacklist
+      region filters to exclude/isolate problematic regions)
 
     Parameters
     ----------
     df : pd.DataFrame
-        Probe-level table (sample, chrom, pos, lrr, baf, state, region_size).
+        Probe-level table (sample, chrom, pos, lrr, baf, state, region_size,
+        blacklist_region).
     summary : pd.DataFrame
         Aggregate statistics from :func:`compute_summary_stats`.
     output_path : str
@@ -407,6 +649,10 @@ def build_dashboard(
     truth_dir : str, optional
         Path to the truth-set BED directory; when provided it is shown in the
         About section alongside the SV truth description.
+    blacklist_dir : str, optional
+        Path to the blacklist BED directory; when provided, source information
+        is shown in the About section and the Blacklist Region Summary section
+        is included in the dashboard.
     """
     try:
         import plotly.graph_objects as go
@@ -794,13 +1040,61 @@ def build_dashboard(
         **_layout_defaults(),
     )
 
+    # ── 8. Blacklist region summary (if blacklist_region column present) ──
+    fig_blacklist: Optional["go.Figure"] = None  # type: ignore[name-defined]
+    bl_summary: Optional[pd.DataFrame] = None
+    if "blacklist_region" in df.columns:
+        bl_summary = build_blacklist_summary(df)
+        has_bl = not bl_summary.empty and any(
+            r != "(none)" for r in bl_summary["blacklist_region"]
+        )
+        if has_bl:
+            # Stacked bar: blacklist region type × SV state
+            bl_pivot = (
+                bl_summary[bl_summary["blacklist_region"] != "(none)"]
+                .pivot_table(
+                    index="blacklist_region",
+                    columns="state",
+                    values="n_probes",
+                    fill_value=0,
+                )
+                .reset_index()
+            )
+            fig_blacklist = go.Figure()
+            for state in STATES:
+                if state in bl_pivot.columns:
+                    fig_blacklist.add_trace(
+                        go.Bar(
+                            x=bl_pivot["blacklist_region"].tolist(),
+                            y=bl_pivot[state].tolist(),
+                            name=state,
+                            marker_color=STATE_COLOURS[state],
+                            opacity=0.85,
+                        )
+                    )
+            fig_blacklist.update_layout(
+                barmode="stack",
+                title_text="Probe Counts per Problematic Region Type by Copy-Number State",
+                xaxis=dict(**_axis_style("Blacklist Region")),
+                yaxis=dict(**_axis_style("Probe count")),
+                height=460,
+                **_layout_defaults(),
+            )
+
     # ── Assemble HTML ─────────────────────────────────────────────────
     html_parts: list[str] = []
     html_parts.append(_html_header())
     html_parts.append('<div class="container">')
 
     # About / methods description (always first)
-    html_parts.append(_about_section_html(df, summary, bcf_path=bcf_path, truth_dir=truth_dir))
+    html_parts.append(
+        _about_section_html(
+            df, summary,
+            bcf_path=bcf_path,
+            truth_dir=truth_dir,
+            blacklist_dir=blacklist_dir,
+        )
+    )
 
     # Density distributions are the key starting figure
     sections = [
@@ -835,6 +1129,10 @@ def build_dashboard(
         )
         html_parts.append("</div>")
 
+    # ── Blacklist region summary section ─────────────────────────────
+    if fig_blacklist is not None and bl_summary is not None:
+        html_parts.append(_blacklist_section_html(fig_blacklist, bl_summary, blacklist_dir))
+
     # ── Interactive filtering panel (JavaScript) ─────────────────────
     html_parts.append(_filter_panel_html(df))
 
@@ -852,6 +1150,7 @@ def _about_section_html(
     *,
     bcf_path: Optional[str] = None,
     truth_dir: Optional[str] = None,
+    blacklist_dir: Optional[str] = None,
 ) -> str:
     """Generate the 'About This Report' section with data sources and methods.
 
@@ -866,6 +1165,9 @@ def _about_section_html(
         Source BCF path; basename is shown in the Data Sources block.
     truth_dir : str, optional
         Truth-set BED directory; shown in the Data Sources block.
+    blacklist_dir : str, optional
+        Blacklist BED directory; shown in the Data Sources block with a list
+        of loaded region track names and their sources.
     """
     samples = sorted(df["sample"].unique().tolist())
     n_samples = len(samples)
@@ -907,6 +1209,38 @@ def _about_section_html(
     truth_label = (
         f"<code>{os.path.abspath(truth_dir)}</code>" if truth_dir else "the supplied truth directory"
     )
+
+    # Build blacklist source block
+    bl_tracks: list[str] = []
+    if blacklist_dir and os.path.isdir(blacklist_dir):
+        for fname in sorted(os.listdir(blacklist_dir)):
+            if fname.endswith(".bed"):
+                bl_tracks.append(fname[:-4])
+    if bl_tracks:
+        bl_dir_label = f"<code>{os.path.abspath(blacklist_dir)}</code>"
+        bl_track_list = "".join(
+            f'<li><code>{t}</code></li>' for t in bl_tracks
+        )
+        blacklist_block = f"""
+    <div class="about-block">
+      <h3>Blacklist / Problematic Regions</h3>
+      <p>Each probe is annotated against known problematic genomic regions for
+      the <strong>T2T-CHM13 v2.0</strong> assembly. Probes in these regions
+      can be excluded or highlighted using the
+      <strong>Interactive Filter Panel</strong> below to assess their impact
+      on signal distributions.</p>
+      <p>Blacklist directory: {bl_dir_label}</p>
+      <p style="margin:6px 0 3px;font-size:13px;font-weight:600;">Region tracks loaded:</p>
+      <ul class="about-list">{bl_track_list}</ul>
+      <p style="margin:8px 0 0;font-size:12px;color:#555;">
+        Sources: Nurk <em>et al.</em> (T2T, <em>Science</em> 2022);
+        Altemose <em>et al.</em> (centromeres, <em>Science</em> 2022);
+        Amemiya <em>et al.</em> (ENCODE Blacklist, <em>Sci Rep</em> 2019).
+        See <code>resources/blacklists/SOURCES.md</code> for full citations.
+      </p>
+    </div>"""
+    else:
+        blacklist_block = ""
 
     return f"""
 <div class="section about-section">
@@ -952,6 +1286,11 @@ def _about_section_html(
     <div class="about-block">
       <h3>Data Sources</h3>
       <ul class="about-list">
+        <li><strong>Reference assembly:</strong>
+        <a href="https://doi.org/10.1126/science.abj6987" target="_blank"
+           rel="noopener noreferrer">T2T-CHM13 v2.0 (GCA_009914755.4)</a>
+        &mdash; Nurk <em>et al.</em> <em>Science</em> 2022. Complete, gapless
+        human genome including all centromeres and telomeres.</li>
         <li><strong>Array probe data:</strong> {bcf_label} with
         per-probe <code>FORMAT/LRR</code> and <code>FORMAT/BAF</code> fields.
         Contains {n_total:,}&nbsp;labelled probe observations across
@@ -970,7 +1309,7 @@ def _about_section_html(
            doi:10.1101/2024.04.18.590093</a></li>
       </ul>
     </div>
-
+{blacklist_block}
     <div class="about-block">
       <h3>Samples ({n_samples})</h3>
       <div class="sample-list">{sample_badges}</div>
@@ -1002,6 +1341,11 @@ def _about_section_html(
         position is classified against pre-loaded, sorted truth intervals via
         binary search (O(log&thinsp;N) per probe). A single BCF pass processes
         all samples simultaneously, keeping I/O at O(records).</li>
+        <li><strong>Blacklist annotation:</strong> In the same BCF pass each
+        probe position is classified against pre-loaded T2T-CHM13 blacklist
+        tracks (centromeres, telomeres, ENCODE-style blacklist). The resulting
+        <code>blacklist_region</code> column enables toggling problematic
+        regions on/off in the filter panel without re-running the pipeline.</li>
         <li><strong>Density normalisation:</strong> Histograms use
         <em>probability density</em> normalisation so each state integrates to
         1.0, placing the rare DEL/DUP classes on an equal visual footing with
@@ -1035,13 +1379,104 @@ def _about_section_html(
         <li><strong>Per-Sample Probe Counts</strong> &mdash; Stacked bar chart
         of probe counts by copy-number state for each sample; highlights
         sample-level imbalances in truth-set coverage.</li>
+        <li><strong>Blacklist Region Summary</strong> &mdash; Stacked bar
+        chart of probe counts per problematic region type (centromere,
+        telomere, ENCODE blacklist) broken down by copy-number state, with
+        a detailed percentage table. Assesses whether blacklist regions are
+        enriched for false-positive DEL/DUP calls.</li>
         <li><strong>Interactive Filter Panel</strong> &mdash; Filter by
-        chromosome, sample, minimum region size, and LRR range; density
-        histograms and violin plots regenerate in real time.</li>
+        chromosome, sample, minimum region size, LRR range, and blacklist
+        region type (include all / exclude blacklist / show only blacklist).
+        Density histograms and violin plots regenerate in real time.</li>
       </ul>
     </div>
 
   </div>
+</div>"""
+
+
+def _blacklist_section_html(
+    fig_blacklist: "go.Figure",  # type: ignore[name-defined]
+    bl_summary: pd.DataFrame,
+    blacklist_dir: Optional[str] = None,
+) -> str:
+    """Build the Blacklist Region Summary section HTML.
+
+    Parameters
+    ----------
+    fig_blacklist :
+        Plotly Figure with the stacked bar chart of probe counts per region.
+    bl_summary : pd.DataFrame
+        Output of :func:`build_blacklist_summary` (blacklist_region, state,
+        n_probes, pct_of_state).
+    blacklist_dir : str, optional
+        Path to the blacklist directory; shown as a source reference.
+    """
+    import plotly.graph_objects as go  # noqa: F401  (ensure available)
+
+    source_note = ""
+    if blacklist_dir:
+        src_md = os.path.join(blacklist_dir, "SOURCES.md")
+        source_note = (
+            f' See <code>{os.path.abspath(src_md)}</code>'
+            " for full citations and download instructions."
+            if os.path.isfile(src_md) else ""
+        )
+
+    # Build a per-region breakdown table
+    non_none = bl_summary[bl_summary["blacklist_region"] != "(none)"].copy()
+    if non_none.empty:
+        table_html = "<p class='section-note'>No probes fall in any blacklist region.</p>"
+    else:
+        rows_html = ""
+        for region, grp in non_none.groupby("blacklist_region"):
+            for _, row in grp.iterrows():
+                state = row["state"]
+                rows_html += (
+                    f'<tr>'
+                    f'<td><code>{region}</code></td>'
+                    f'<td><span class="badge-{state}">{state}</span></td>'
+                    f'<td>{int(row["n_probes"]):,}</td>'
+                    f'<td>{float(row["pct_of_state"]):.2f}%</td>'
+                    f'</tr>'
+                )
+        table_html = f"""
+<table class="stats-table" style="margin-top:14px;">
+  <thead><tr>
+    <th>Blacklist Region</th><th>State</th>
+    <th>Probes in region</th><th>% of state total</th>
+  </tr></thead>
+  <tbody>{rows_html}</tbody>
+</table>"""
+
+    chart_html = fig_blacklist.to_html(full_html=False, include_plotlyjs=False)
+
+    return f"""
+<div class="section">
+  <h2>Blacklist Region Summary (T2T-CHM13 v2.0)</h2>
+  <p class="section-note">
+    Probe counts per known problematic region type, broken down by
+    copy-number state. A high proportion of DEL or DUP calls in centromere or
+    telomere regions suggests potential false positives driven by repetitive-element
+    signal artefacts. Use the <strong>Interactive Filter Panel</strong> below to
+    exclude these regions from the density distributions and assess the impact
+    on your calls.{source_note}
+  </p>
+  <p style="font-size:12px;color:#666;margin-bottom:6px;">
+    <strong>Sources:</strong>
+    Centromeres &mdash; Altemose <em>et al.</em>
+    <a href="https://doi.org/10.1126/science.abl4178" target="_blank" rel="noopener noreferrer">
+      <em>Science</em> 2022;376:eabl4178</a>;
+    Telomeres &amp; assembly &mdash; Nurk <em>et al.</em>
+    <a href="https://doi.org/10.1126/science.abj6987" target="_blank" rel="noopener noreferrer">
+      <em>Science</em> 2022;376:44&ndash;53</a>;
+    ENCODE Blacklist &mdash; Amemiya <em>et al.</em>
+    <a href="https://doi.org/10.1038/s41598-019-45839-z" target="_blank" rel="noopener noreferrer">
+      <em>Sci Rep</em> 2019;9:9354</a>.
+    All regions are for T2T-CHM13 v2.0 (GCA_009914755.4).
+  </p>
+  {chart_html}
+  {table_html}
 </div>"""
 
 
@@ -1272,9 +1707,17 @@ def _filter_panel_html(df: pd.DataFrame) -> str:
     chroms = sorted(df["chrom"].unique().tolist(), key=_chrom_sort_key)
     samples = sorted(df["sample"].unique().tolist())
 
+    # Collect distinct blacklist region types present in the data
+    bl_col = df.get("blacklist_region") if hasattr(df, "get") else df["blacklist_region"] if "blacklist_region" in df.columns else None
+    bl_regions: list[str] = []
+    if bl_col is not None:
+        bl_regions = sorted(r for r in bl_col.unique().tolist() if r)
+
     # Sub-sample for the filter panel to keep HTML size manageable
     cap = min(len(df), 300_000)
     sub = df.sample(n=cap, random_state=42) if len(df) > cap else df
+
+    bl_list = sub["blacklist_region"].tolist() if "blacklist_region" in sub.columns else [""] * len(sub)
 
     data_json = json.dumps(
         {
@@ -1284,6 +1727,7 @@ def _filter_panel_html(df: pd.DataFrame) -> str:
             "baf": [round(v, 5) for v in sub["baf"].tolist()],
             "state": sub["state"].tolist(),
             "region_size": sub["region_size"].tolist(),
+            "blacklist_region": bl_list,
         }
     )
 
@@ -1293,6 +1737,10 @@ def _filter_panel_html(df: pd.DataFrame) -> str:
     sample_options = "".join(
         f'<option value="{s}">{s}</option>' for s in samples
     )
+    bl_region_options = "".join(
+        f'<option value="{r}">{r}</option>' for r in bl_regions
+    )
+    has_blacklist = "true" if bl_regions else "false"
 
     return f"""
 <div class="filter-panel section">
@@ -1301,8 +1749,11 @@ def _filter_panel_html(df: pd.DataFrame) -> str:
     Apply any combination of filters below and click
     <strong>Apply Filters</strong> to regenerate density histograms,
     violin plots and summary statistics for the matching probe subset.
+    Use the <strong>Blacklist regions</strong> filter to exclude or isolate
+    probes in problematic T2T-CHM13 regions (centromeres, telomeres, ENCODE
+    blacklist) and assess their impact on the signal distributions.
     Violin plots can be further toggled between all states and
-    DEL&nbsp;/&nbsp;DUP only using the checkboxes.
+    DEL&nbsp;/&nbsp;DUP only.
   </p>
   <div class="filter-row">
     <div class="filter-group">
@@ -1332,6 +1783,15 @@ def _filter_panel_html(df: pd.DataFrame) -> str:
       </div>
     </div>
     <div class="filter-group">
+      <label>Blacklist regions</label>
+      <select id="filt-blacklist">
+        <option value="all" selected>Include all</option>
+        <option value="exclude">Exclude blacklist</option>
+        <option value="only">Show only blacklist</option>
+        {f'<optgroup label="Single track">{bl_region_options}</optgroup>' if bl_region_options else ''}
+      </select>
+    </div>
+    <div class="filter-group">
       <label>Violin states</label>
       <select id="filt-violin-states">
         <option value="all" selected>DEL + NORMAL + DUP</option>
@@ -1359,6 +1819,7 @@ var _FONT    = {{family:'Arial, Helvetica, sans-serif', size:13, color:'#2c2c2c'
 var _AXFONT  = {{family:'Arial, Helvetica, sans-serif', size:12}};
 // Allowlist of valid state labels to prevent unintended HTML injection
 var _VALID_STATES = {{'DEL':true,'NORMAL':true,'DUP':true}};
+var _HAS_BLACKLIST = {has_blacklist};
 
 function _axis(title) {{
   return {{
@@ -1375,12 +1836,18 @@ function applyFilters() {{
   var minSz     = parseFloat(document.getElementById('filt-min-size').value) || 0;
   var lrrLo     = parseFloat(document.getElementById('filt-lrr-lo').value);
   var lrrHi     = parseFloat(document.getElementById('filt-lrr-hi').value);
+  var blMode    = document.getElementById('filt-blacklist').value;
   var violinSts = document.getElementById('filt-violin-states').value;
   var histNorm  = document.getElementById('filt-histnorm').value;
   var yAxisLabel = histNorm === 'probability density' ? 'Probability Density' : 'Count';
+  var blLabel;
+  if (blMode === 'exclude')   blLabel = ' (blacklist excluded)';
+  else if (blMode === 'only') blLabel = ' (blacklist only)';
+  else if (blMode !== 'all')  blLabel = ' (' + blMode + ' only)';
+  else                        blLabel = '';
   var histTitle  = histNorm === 'probability density'
-    ? 'Filtered LRR &amp; BAF Probability Density by Copy-Number State'
-    : 'Filtered LRR &amp; BAF Distributions by Copy-Number State';
+    ? 'Filtered LRR &amp; BAF Probability Density by Copy-Number State' + blLabel
+    : 'Filtered LRR &amp; BAF Distributions by Copy-Number State' + blLabel;
 
   var filtered = {{}};
   var n = _DATA.chrom.length;
@@ -1389,6 +1856,13 @@ function applyFilters() {{
     if (sample !== 'ALL' && _DATA.sample[i] !== sample) continue;
     if (_DATA.region_size[i] < minSz && _DATA.state[i] !== 'NORMAL') continue;
     if (_DATA.lrr[i] < lrrLo || _DATA.lrr[i] > lrrHi) continue;
+    // Blacklist filter
+    if (_HAS_BLACKLIST) {{
+      var bl = _DATA.blacklist_region[i] || '';
+      if (blMode === 'exclude' && bl !== '') continue;
+      if (blMode === 'only'    && bl === '') continue;
+      if (blMode !== 'all' && blMode !== 'exclude' && blMode !== 'only' && bl !== blMode) continue;
+    }}
     var st = _DATA.state[i];
     if (!_VALID_STATES[st]) continue;  // skip any unexpected state label
     if (!filtered[st]) filtered[st] = {{lrr:[], baf:[]}};
@@ -1555,6 +2029,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Cap the number of samples processed (default: all matched).",
     )
+    p.add_argument(
+        "--blacklist-dir",
+        default=_REPO_BLACKLIST_DIR,
+        help=(
+            "Directory of .bed blacklist files for T2T-CHM13 v2.0 problematic "
+            "regions (centromeres, telomeres, ENCODE blacklist). "
+            "Defaults to resources/blacklists/ within the repository. "
+            "Set to '' to disable blacklist annotation."
+        ),
+    )
     return p
 
 
@@ -1569,10 +2053,14 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+    blacklist_dir: Optional[str] = args.blacklist_dir if args.blacklist_dir else None
+
     # ── Collect probe data ────────────────────────────────────────────
     LOG.info("Collecting probe data …")
     df = collect_probe_data(
-        args.bcf, args.truth_dir, max_samples=args.max_samples
+        args.bcf, args.truth_dir,
+        max_samples=args.max_samples,
+        blacklist_dir=blacklist_dir,
     )
 
     # ── Write probe-level TSV ─────────────────────────────────────────
@@ -1593,6 +2081,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         df, summary, dash_path,
         bcf_path=args.bcf,
         truth_dir=args.truth_dir,
+        blacklist_dir=blacklist_dir,
     )
     LOG.info("All outputs in %s", args.output_dir)
 

@@ -1,0 +1,92 @@
+# T2T CHM13 v2.0 ENCODE-style blacklist — problematic regions for NGS and array assays
+# Assembly: T2T-CHM13 v2.0 (GCA_009914755.4)
+# Source: Adapted from Amemiya HM, Kundaje A, Boyle AP.
+#   "The ENCODE Blacklist: Identification of Problematic Regions of the Genome."
+#   Sci Rep. 2019;9(1):9354. doi:10.1038/s41598-019-45839-z
+#   Full T2T CHM13 blacklist: https://github.com/Boyle-Lab/Blacklist (see CHM13 release)
+# Additional source: T2T Consortium difficult-region annotations (satellite DNA,
+#   segmental duplications, low-mappability):
+#   https://github.com/marbl/CHM13/blob/master/Supplemental/
+# Coordinates are 0-based, half-open (BED format).
+# Regions included: pericentromeric heterochromatin flanks, large satellite arrays
+# (HSat1-3, alphoid satellites), acrocentric short arms, and telomeres.
+# See resources/blacklists/SOURCES.md for full citation details.
+chr1	0	10000	encode_blacklist
+chr1	120875000	144510000	encode_blacklist
+chr1	248377328	248387328	encode_blacklist
+chr10	0	10000	encode_blacklist
+chr10	39200000	42200000	encode_blacklist
+chr10	134748134	134758134	encode_blacklist
+chr11	0	10000	encode_blacklist
+chr11	50400000	57200000	encode_blacklist
+chr11	135117769	135127769	encode_blacklist
+chr12	0	10000	encode_blacklist
+chr12	33200000	37400000	encode_blacklist
+chr12	133314548	133324548	encode_blacklist
+chr13	0	10000	encode_blacklist
+chr13	0	15000000	encode_blacklist
+chr13	15000000	18300000	encode_blacklist
+chr13	113556686	113566686	encode_blacklist
+chr14	0	14500000	encode_blacklist
+chr14	0	10000	encode_blacklist
+chr14	14500000	17700000	encode_blacklist
+chr14	101151492	101161492	encode_blacklist
+chr15	0	14900000	encode_blacklist
+chr15	0	10000	encode_blacklist
+chr15	14900000	18100000	encode_blacklist
+chr15	99743195	99753195	encode_blacklist
+chr16	0	10000	encode_blacklist
+chr16	35300000	39600000	encode_blacklist
+chr16	96320374	96330374	encode_blacklist
+chr17	0	10000	encode_blacklist
+chr17	24600000	28000000	encode_blacklist
+chr17	84266897	84276897	encode_blacklist
+chr18	0	10000	encode_blacklist
+chr18	15700000	22400000	encode_blacklist
+chr18	80532538	80542538	encode_blacklist
+chr19	0	10000	encode_blacklist
+chr19	25700000	30100000	encode_blacklist
+chr19	61697364	61707364	encode_blacklist
+chr2	0	10000	encode_blacklist
+chr2	88430000	100000000	encode_blacklist
+chr2	242686752	242696752	encode_blacklist
+chr20	0	10000	encode_blacklist
+chr20	27700000	31200000	encode_blacklist
+chr20	66200255	66210255	encode_blacklist
+chr21	0	10500000	encode_blacklist
+chr21	0	10000	encode_blacklist
+chr21	10500000	13900000	encode_blacklist
+chr21	45080682	45090682	encode_blacklist
+chr22	0	13000000	encode_blacklist
+chr22	0	10000	encode_blacklist
+chr22	13000000	17200000	encode_blacklist
+chr22	51314926	51324926	encode_blacklist
+chr3	0	10000	encode_blacklist
+chr3	89000000	100000000	encode_blacklist
+chr3	201095948	201105948	encode_blacklist
+chr4	0	10000	encode_blacklist
+chr4	48600000	57000000	encode_blacklist
+chr4	193564945	193574945	encode_blacklist
+chr5	0	10000	encode_blacklist
+chr5	46600000	51300000	encode_blacklist
+chr5	182035439	182045439	encode_blacklist
+chr6	0	10000	encode_blacklist
+chr6	57900000	62000000	encode_blacklist
+chr6	172116628	172126628	encode_blacklist
+chr7	0	10000	encode_blacklist
+chr7	60100000	62600000	encode_blacklist
+chr7	160557428	160567428	encode_blacklist
+chr8	0	10000	encode_blacklist
+chr8	43800000	46900000	encode_blacklist
+chr8	146249331	146259331	encode_blacklist
+chr9	0	10000	encode_blacklist
+chr9	42400000	70000000	encode_blacklist
+chr9	42400000	52000000	encode_blacklist
+chr9	150607247	150617247	encode_blacklist
+chrX	0	10000	encode_blacklist
+chrX	60400000	67400000	encode_blacklist
+chrX	154249566	154259566	encode_blacklist
+chrY	0	10000	encode_blacklist
+chrY	10200000	12100000	encode_blacklist
+chrY	56700000	62460029	encode_blacklist
+chrY	62450029	62460029	encode_blacklist
