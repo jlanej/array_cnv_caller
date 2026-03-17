@@ -332,7 +332,7 @@ class TestBuildDashboard:
         build_dashboard(probe_stats_df, summary, out)
         with open(out) as f:
             content = f.read()
-        assert "Interactive Filtering" in content
+        assert "Interactive Filtering Panel" in content
         assert "applyFilters" in content
 
     def test_html_self_contained(self, probe_stats_df, tmp_path):
