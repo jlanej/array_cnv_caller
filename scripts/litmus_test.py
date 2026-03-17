@@ -374,14 +374,19 @@ def build_dashboard(
     df: pd.DataFrame,
     summary: pd.DataFrame,
     output_path: str,
+    *,
+    bcf_path: Optional[str] = None,
+    truth_dir: Optional[str] = None,
 ) -> None:
     """Generate a self-contained interactive HTML dashboard.
 
     The dashboard includes:
+    * An "About This Report" section with data sources, signal explanations,
+      sample list, truth-set statistics, methods, and a plot guide
     * LRR and BAF probability-density histograms per state (normalised so that
-      the dominant NORMAL class does not obscure DEL / DUP shapes)
+      the dominant NORMAL class does not obscure DEL / DUP shapes) — primary
+      diagnostic figure shown first
     * DEL vs DUP direct comparison histograms (NORMAL excluded)
-    * Violin + box-plots for LRR and BAF (interactively filtered)
     * 2-D LRR×BAF scatter coloured by state (sub-sampled for speed)
     * Per-chromosome LRR distributions
     * Summary statistics table
@@ -396,6 +401,12 @@ def build_dashboard(
         Aggregate statistics from :func:`compute_summary_stats`.
     output_path : str
         File path for the HTML report.
+    bcf_path : str, optional
+        Path to the source BCF file; when provided the filename is shown in
+        the About section so readers know exactly which data were used.
+    truth_dir : str, optional
+        Path to the truth-set BED directory; when provided it is shown in the
+        About section alongside the SV truth description.
     """
     try:
         import plotly.graph_objects as go
@@ -789,7 +800,7 @@ def build_dashboard(
     html_parts.append('<div class="container">')
 
     # About / methods description (always first)
-    html_parts.append(_about_section_html(df, summary))
+    html_parts.append(_about_section_html(df, summary, bcf_path=bcf_path, truth_dir=truth_dir))
 
     # Density distributions are the key starting figure
     sections = [
@@ -835,7 +846,13 @@ def build_dashboard(
     LOG.info("Dashboard written to %s", output_path)
 
 
-def _about_section_html(df: pd.DataFrame, summary: pd.DataFrame) -> str:
+def _about_section_html(
+    df: pd.DataFrame,
+    summary: pd.DataFrame,
+    *,
+    bcf_path: Optional[str] = None,
+    truth_dir: Optional[str] = None,
+) -> str:
     """Generate the 'About This Report' section with data sources and methods.
 
     Parameters
@@ -845,6 +862,10 @@ def _about_section_html(df: pd.DataFrame, summary: pd.DataFrame) -> str:
     summary : pd.DataFrame
         Aggregate stats from :func:`compute_summary_stats`; used to show
         per-state LRR summary statistics inline.
+    bcf_path : str, optional
+        Source BCF path; basename is shown in the Data Sources block.
+    truth_dir : str, optional
+        Truth-set BED directory; shown in the Data Sources block.
     """
     samples = sorted(df["sample"].unique().tolist())
     n_samples = len(samples)
@@ -877,6 +898,15 @@ def _about_section_html(df: pd.DataFrame, summary: pd.DataFrame) -> str:
         )
 
     stat_rows = "".join(_stat_row(st) for st in ["DEL", "NORMAL", "DUP"])
+
+    # Build dynamic data-source lines so the About block stays accurate
+    # regardless of which BCF or truth directory the caller used.
+    bcf_label = (
+        f"<code>{os.path.basename(bcf_path)}</code>" if bcf_path else "a multi-sample BCF file"
+    )
+    truth_label = (
+        f"<code>{os.path.abspath(truth_dir)}</code>" if truth_dir else "the supplied truth directory"
+    )
 
     return f"""
 <div class="section about-section">
@@ -922,16 +952,15 @@ def _about_section_html(df: pd.DataFrame, summary: pd.DataFrame) -> str:
     <div class="about-block">
       <h3>Data Sources</h3>
       <ul class="about-list">
-        <li><strong>Array probe data:</strong> Multi-sample BCF
-        (<code>stage2_reclustered.selected.array.samples.vcf.gz</code>) with
+        <li><strong>Array probe data:</strong> {bcf_label} with
         per-probe <code>FORMAT/LRR</code> and <code>FORMAT/BAF</code> fields.
         Contains {n_total:,}&nbsp;labelled probe observations across
         {n_samples}&nbsp;sample{'s' if n_samples != 1 else ''}.</li>
-        <li><strong>Structural variant truth set:</strong> DEL/DUP calls from
-        the <em>shapeit5</em>-phased 1000&nbsp;Genomes ONT Vienna callset
-        (variants &ge;&thinsp;1,000&nbsp;bp retained). Each probe overlapping
-        a truth interval is labelled DEL or DUP; all remaining probes are
-        labelled NORMAL.</li>
+        <li><strong>Structural variant truth set:</strong> Per-sample BED files
+        from {truth_label}. DEL/DUP calls &ge;&thinsp;1,000&nbsp;bp are used
+        as ground-truth copy-number intervals. Each probe overlapping a truth
+        interval is labelled DEL or DUP; all remaining probes are labelled
+        NORMAL.</li>
         <li><strong>Primary citation:</strong> Schloissnig&nbsp;S &amp;
         Pani&nbsp;S. <em>Long-read sequencing and structural variant
         characterization in 1,019 samples from the 1000 Genomes
@@ -1560,7 +1589,11 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     # ── Interactive dashboard ─────────────────────────────────────────
     dash_path = os.path.join(args.output_dir, "litmus_report.html")
-    build_dashboard(df, summary, dash_path)
+    build_dashboard(
+        df, summary, dash_path,
+        bcf_path=args.bcf,
+        truth_dir=args.truth_dir,
+    )
     LOG.info("All outputs in %s", args.output_dir)
 
 
