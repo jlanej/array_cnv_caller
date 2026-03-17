@@ -1463,12 +1463,12 @@ def _blacklist_section_html(
     on your calls.{source_note}
   </p>
   <p style="font-size:12px;color:#666;margin-bottom:6px;">
-    <strong>Sources &amp; provenance:</strong>
+    <strong>Sources &amp; provenance (all coordinates T2T-CHM13 v2.0 / GCA_009914755.4):</strong>
     <strong>Centromeres</strong> &mdash; coordinates derived from Altemose <em>et al.</em>
     <a href="https://doi.org/10.1126/science.abl4178" target="_blank" rel="noopener noreferrer">
       <em>Science</em> 2022;376:eabl4178</a>
     Table S2 (CHM13v2.0 HOR boundaries ± 500 kb flanks);
-    canonical track:
+    canonical T2T track:
     <a href="https://s3-us-west-2.amazonaws.com/human-pangenomics/T2T/CHM13/assemblies/annotation/chm13v2.0_censat_v2.0.bed"
        target="_blank" rel="noopener noreferrer">cenSat v2.0 (T2T S3)</a>.
     <strong>Telomeres</strong> &mdash; 10 kb windows computed from confirmed T2T CHM13 v2.0
@@ -1477,17 +1477,17 @@ def _blacklist_section_html(
       <em>Science</em> 2022;376:44&ndash;53</a>;
     NCBI <a href="https://www.ncbi.nlm.nih.gov/assembly/GCA_009914755.4" target="_blank"
       rel="noopener noreferrer">GCA_009914755.4</a>);
-    canonical track:
+    canonical T2T track:
     <a href="https://s3-us-west-2.amazonaws.com/human-pangenomics/T2T/CHM13/assemblies/annotation/chm13v2.0_telomere.bed"
        target="_blank" rel="noopener noreferrer">telomere.bed (T2T S3)</a>.
-    <strong>ENCODE-style blacklist</strong> &mdash; <em>manually curated</em>; the
-    <a href="https://github.com/Boyle-Lab/Blacklist" target="_blank" rel="noopener noreferrer">Boyle-Lab
-    ENCODE Blacklist</a> (Amemiya <em>et al.</em>
+    <strong>ENCODE-style blacklist</strong> &mdash; <em>manually curated with T2T CHM13 v2.0 coordinates</em>
+    (no CHM13 version of the Boyle-Lab ENCODE Blacklist exists);
+    constructed from the T2T cenSat and telomere tracks above plus acrocentric short arms
+    (chr13/14/15/21/22) and chr9 pericentromeric heterochromatin.
+    Conceptual framework: Amemiya <em>et al.</em>
     <a href="https://doi.org/10.1038/s41598-019-45839-z" target="_blank" rel="noopener noreferrer">
-      <em>Sci Rep</em> 2019;9:9354</a>) does not have a published CHM13/T2T release;
-    this file combines centromere, telomere, acrocentric short arms (chr13/14/15/21/22),
-    and chr9 pericentromeric heterochromatin as a conservative proxy.
-    See <code>resources/blacklists/SOURCES.md</code> for full provenance and download commands.
+      <em>Sci Rep</em> 2019;9:9354</a>.
+    See <code>resources/blacklists/SOURCES.md</code> for full provenance and T2T download commands.
   </p>
   {chart_html}
   {table_html}
