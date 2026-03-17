@@ -502,6 +502,10 @@ def build_dashboard(
     # Using histnorm="probability density" means each state's curve
     # integrates to 1, so the rare DEL / DUP states are equally visible
     # alongside the dominant NORMAL class.
+    # go.Histogram embeds raw x-values (Plotly.js bins client-side), so
+    # we cap each state at 200 K points — the density shape is faithfully
+    # preserved by subsampling, and the legend label always shows the
+    # full population count.
     fig_hist = make_subplots(
         rows=1,
         cols=2,
@@ -510,9 +514,10 @@ def build_dashboard(
         horizontal_spacing=0.10,
     )
     for state in STATES:
-        sub = df[df["state"] == state]
+        sub_full = df[df["state"] == state]
         colour = STATE_COLOURS[state]
-        n_state = len(sub)
+        n_state = len(sub_full)          # full count for the legend label
+        sub = _subsample(sub_full, 200_000)
         fig_hist.add_trace(
             go.Histogram(
                 x=sub["lrr"],
@@ -568,9 +573,10 @@ def build_dashboard(
         horizontal_spacing=0.10,
     )
     for state in ["DEL", "DUP"]:
-        sub = df[df["state"] == state]
+        sub_full = df[df["state"] == state]
         colour = STATE_COLOURS[state]
-        n_state = len(sub)
+        n_state = len(sub_full)          # full count for the legend label
+        sub = _subsample(sub_full, 200_000)
         fig_del_dup.add_trace(
             go.Histogram(
                 x=sub["lrr"],
@@ -693,10 +699,12 @@ def build_dashboard(
     )
 
     # ── 5. Per-chromosome LRR box-plots ──────────────────────────────
+    # go.Box also embeds raw y-values, so cap each state to keep HTML size
+    # manageable without affecting the per-chromosome quartile estimates.
     chroms = sorted(df["chrom"].unique(), key=_chrom_sort_key)
     fig_chrom = go.Figure()
     for state in STATES:
-        sub = df[df["state"] == state]
+        sub = _subsample(df[df["state"] == state], 50_000)
         fig_chrom.add_trace(
             go.Box(
                 x=sub["chrom"],
