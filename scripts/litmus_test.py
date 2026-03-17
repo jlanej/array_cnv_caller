@@ -378,13 +378,15 @@ def build_dashboard(
     """Generate a self-contained interactive HTML dashboard.
 
     The dashboard includes:
-    * LRR and BAF histograms per state with overlaid densities
-    * Violin + box-plots for LRR and BAF
+    * LRR and BAF probability-density histograms per state (normalised so that
+      the dominant NORMAL class does not obscure DEL / DUP shapes)
+    * DEL vs DUP direct comparison histograms (NORMAL excluded)
+    * Violin + box-plots for LRR and BAF (interactively filtered)
     * 2-D LRR×BAF scatter coloured by state (sub-sampled for speed)
     * Per-chromosome LRR distributions
     * Summary statistics table
-    * Drop-down menus for chromosome and sample filtering
-    * Range sliders for region-size filtering
+    * Interactive filter panel that regenerates histograms **and** violin plots
+      in real time (chromosome, sample, region-size, and LRR-range filters)
 
     Parameters
     ----------
@@ -405,8 +407,41 @@ def build_dashboard(
         )
         raise
 
-    STATE_COLOURS = {"DEL": "#d62728", "NORMAL": "#2ca02c", "DUP": "#1f77b4"}
+    # Publication-quality colour palette (colourblind-friendly)
+    STATE_COLOURS = {"DEL": "#E15759", "NORMAL": "#4E79A7", "DUP": "#F28E2B"}
     STATES = ["DEL", "NORMAL", "DUP"]
+    TEMPLATE = "plotly_white"
+    FONT = dict(family="Arial, Helvetica, sans-serif", size=13, color="#2c2c2c")
+    TITLE_FONT = dict(family="Arial, Helvetica, sans-serif", size=15, color="#1a1a1a")
+    AXIS_FONT = dict(family="Arial, Helvetica, sans-serif", size=12)
+
+    def _layout_defaults(**extra) -> dict:
+        """Return a dict of common publication-quality layout settings."""
+        base = dict(
+            template=TEMPLATE,
+            font=FONT,
+            title_font=TITLE_FONT,
+            legend=dict(
+                bgcolor="rgba(255,255,255,0.8)",
+                bordercolor="#cccccc",
+                borderwidth=1,
+                font=dict(size=12),
+            ),
+            margin=dict(l=70, r=30, t=70, b=60),
+        )
+        base.update(extra)
+        return base
+
+    def _axis_style(title: str) -> dict:
+        return dict(
+            title_text=title,
+            title_font=AXIS_FONT,
+            tickfont=AXIS_FONT,
+            showgrid=True,
+            gridcolor="#ebebeb",
+            zeroline=True,
+            zerolinecolor="#cccccc",
+        )
 
     # -- Utility: subsample for large datasets -------------------------
     def _subsample(data: pd.DataFrame, n: int = 50_000) -> pd.DataFrame:
@@ -414,74 +449,134 @@ def build_dashboard(
             return data
         return data.sample(n=n, random_state=42)
 
-    # ── 1. Histograms (LRR & BAF) ────────────────────────────────────
+    # ── 1. Density histograms (LRR & BAF) ────────────────────────────
+    # Using histnorm="probability density" means each state's curve
+    # integrates to 1, so the rare DEL / DUP states are equally visible
+    # alongside the dominant NORMAL class.
     fig_hist = make_subplots(
         rows=1,
         cols=2,
-        subplot_titles=("LRR by State", "BAF by State"),
-        horizontal_spacing=0.08,
+        subplot_titles=("LRR Probability Density by State",
+                        "BAF Probability Density by State"),
+        horizontal_spacing=0.10,
     )
     for state in STATES:
         sub = df[df["state"] == state]
+        colour = STATE_COLOURS[state]
+        n_state = len(sub)
         fig_hist.add_trace(
             go.Histogram(
                 x=sub["lrr"],
-                name=f"{state} LRR",
-                marker_color=STATE_COLOURS[state],
-                opacity=0.6,
-                nbinsx=200,
+                name=f"{state} (n={n_state:,})",
+                marker_color=colour,
+                opacity=0.65,
+                nbinsx=150,
+                histnorm="probability density",
                 legendgroup=state,
                 showlegend=True,
             ),
-            row=1,
-            col=1,
+            row=1, col=1,
         )
         fig_hist.add_trace(
             go.Histogram(
                 x=sub["baf"],
                 name=f"{state} BAF",
-                marker_color=STATE_COLOURS[state],
-                opacity=0.6,
-                nbinsx=200,
+                marker_color=colour,
+                opacity=0.65,
+                nbinsx=150,
+                histnorm="probability density",
                 legendgroup=state,
                 showlegend=False,
             ),
-            row=1,
-            col=2,
+            row=1, col=2,
         )
     fig_hist.update_layout(
         barmode="overlay",
-        title_text="LRR & BAF Distributions by Copy-Number State",
-        height=500,
+        title_text="LRR &amp; BAF Probability Density by Copy-Number State",
+        height=520,
+        **_layout_defaults(),
     )
-    fig_hist.update_xaxes(title_text="LRR", row=1, col=1)
-    fig_hist.update_xaxes(title_text="BAF", row=1, col=2)
-    fig_hist.update_yaxes(title_text="Count", row=1, col=1)
-    fig_hist.update_yaxes(title_text="Count", row=1, col=2)
+    fig_hist.update_xaxes(**_axis_style("LRR"), row=1, col=1)
+    fig_hist.update_xaxes(**_axis_style("BAF"), row=1, col=2)
+    fig_hist.update_yaxes(**_axis_style("Probability Density"), row=1, col=1)
+    fig_hist.update_yaxes(**_axis_style("Probability Density"), row=1, col=2)
 
-    # ── 2. Violin / box-plots ────────────────────────────────────────
+    # ── 2. DEL vs DUP direct comparison (NORMAL excluded) ────────────
+    # Removing the dominant NORMAL class reveals subtle shape differences
+    # between deletions and duplications at the same density scale.
+    fig_del_dup = make_subplots(
+        rows=1,
+        cols=2,
+        subplot_titles=("LRR: DEL vs DUP (NORMAL excluded)",
+                        "BAF: DEL vs DUP (NORMAL excluded)"),
+        horizontal_spacing=0.10,
+    )
+    for state in ["DEL", "DUP"]:
+        sub = df[df["state"] == state]
+        colour = STATE_COLOURS[state]
+        n_state = len(sub)
+        fig_del_dup.add_trace(
+            go.Histogram(
+                x=sub["lrr"],
+                name=f"{state} (n={n_state:,})",
+                marker_color=colour,
+                opacity=0.70,
+                nbinsx=120,
+                histnorm="probability density",
+                legendgroup=state,
+                showlegend=True,
+            ),
+            row=1, col=1,
+        )
+        fig_del_dup.add_trace(
+            go.Histogram(
+                x=sub["baf"],
+                name=f"{state} BAF",
+                marker_color=colour,
+                opacity=0.70,
+                nbinsx=120,
+                histnorm="probability density",
+                legendgroup=state,
+                showlegend=False,
+            ),
+            row=1, col=2,
+        )
+    fig_del_dup.update_layout(
+        barmode="overlay",
+        title_text="DEL vs DUP Distribution Comparison",
+        height=520,
+        **_layout_defaults(),
+    )
+    fig_del_dup.update_xaxes(**_axis_style("LRR"), row=1, col=1)
+    fig_del_dup.update_xaxes(**_axis_style("BAF"), row=1, col=2)
+    fig_del_dup.update_yaxes(**_axis_style("Probability Density"), row=1, col=1)
+    fig_del_dup.update_yaxes(**_axis_style("Probability Density"), row=1, col=2)
+
+    # ── 3. Violin / box-plots (static overview) ───────────────────────
+    # The interactive filter panel below regenerates these in real time.
     fig_violin = make_subplots(
         rows=1,
         cols=2,
         subplot_titles=("LRR by State", "BAF by State"),
-        horizontal_spacing=0.08,
+        horizontal_spacing=0.10,
     )
     for state in STATES:
         sub = _subsample(df[df["state"] == state])
+        colour = STATE_COLOURS[state]
         fig_violin.add_trace(
             go.Violin(
                 y=sub["lrr"],
                 name=state,
                 box_visible=True,
                 meanline_visible=True,
-                fillcolor=STATE_COLOURS[state],
-                line_color=STATE_COLOURS[state],
-                opacity=0.7,
+                fillcolor=colour,
+                line_color=colour,
+                opacity=0.75,
                 legendgroup=state,
                 showlegend=True,
+                points=False,
             ),
-            row=1,
-            col=1,
+            row=1, col=1,
         )
         fig_violin.add_trace(
             go.Violin(
@@ -489,26 +584,30 @@ def build_dashboard(
                 name=state,
                 box_visible=True,
                 meanline_visible=True,
-                fillcolor=STATE_COLOURS[state],
-                line_color=STATE_COLOURS[state],
-                opacity=0.7,
+                fillcolor=colour,
+                line_color=colour,
+                opacity=0.75,
                 legendgroup=state,
                 showlegend=False,
+                points=False,
             ),
-            row=1,
-            col=2,
+            row=1, col=2,
         )
     fig_violin.update_layout(
-        title_text="LRR & BAF Violin + Box Plots by State",
-        height=500,
+        violinmode="group",
+        title_text="LRR &amp; BAF Violin + Box Plots by State (full dataset)",
+        height=560,
+        **_layout_defaults(),
     )
-    fig_violin.update_yaxes(title_text="LRR", row=1, col=1)
-    fig_violin.update_yaxes(title_text="BAF", row=1, col=2)
+    fig_violin.update_yaxes(**_axis_style("LRR"), row=1, col=1)
+    fig_violin.update_yaxes(**_axis_style("BAF"), row=1, col=2)
 
-    # ── 3. 2-D scatter (LRR vs BAF) ──────────────────────────────────
+    # ── 4. 2-D scatter (LRR vs BAF) ──────────────────────────────────
     fig_scatter = go.Figure()
-    for state in STATES:
-        sub = _subsample(df[df["state"] == state], n=20_000)
+    # Plot NORMAL first (background) then DEL/DUP on top for visibility
+    for state in ["NORMAL", "DEL", "DUP"]:
+        n_pts = 15_000 if state == "NORMAL" else 20_000
+        sub = _subsample(df[df["state"] == state], n=n_pts)
         fig_scatter.add_trace(
             go.Scattergl(
                 x=sub["lrr"],
@@ -517,19 +616,20 @@ def build_dashboard(
                 name=state,
                 marker=dict(
                     color=STATE_COLOURS[state],
-                    size=3,
-                    opacity=0.4,
+                    size=3 if state == "NORMAL" else 4,
+                    opacity=0.25 if state == "NORMAL" else 0.55,
                 ),
             )
         )
     fig_scatter.update_layout(
-        title_text="LRR vs BAF (sub-sampled, coloured by state)",
-        xaxis_title="LRR",
-        yaxis_title="BAF",
-        height=600,
+        title_text="LRR vs BAF (sub-sampled; DEL/DUP plotted over NORMAL)",
+        xaxis=dict(**_axis_style("LRR")),
+        yaxis=dict(**_axis_style("BAF")),
+        height=620,
+        **_layout_defaults(),
     )
 
-    # ── 4. Per-chromosome LRR box-plots ──────────────────────────────
+    # ── 5. Per-chromosome LRR box-plots ──────────────────────────────
     chroms = sorted(df["chrom"].unique(), key=_chrom_sort_key)
     fig_chrom = go.Figure()
     for state in STATES:
@@ -540,19 +640,22 @@ def build_dashboard(
                 y=sub["lrr"],
                 name=state,
                 marker_color=STATE_COLOURS[state],
+                line_color=STATE_COLOURS[state],
                 boxmean="sd",
+                opacity=0.85,
             )
         )
     fig_chrom.update_layout(
-        title_text="LRR Distribution per Chromosome by State",
-        xaxis_title="Chromosome",
-        yaxis_title="LRR",
+        title_text="LRR Distribution per Chromosome by Copy-Number State",
+        xaxis=dict(**_axis_style("Chromosome"),
+                   categoryorder="array", categoryarray=chroms),
+        yaxis=dict(**_axis_style("LRR")),
         boxmode="group",
-        height=500,
-        xaxis=dict(categoryorder="array", categoryarray=chroms),
+        height=520,
+        **_layout_defaults(),
     )
 
-    # ── 5. Region size vs mean LRR (for DEL/DUP only) ────────────────
+    # ── 6. Region size vs mean LRR (for DEL/DUP only) ────────────────
     fig_size = go.Figure()
     for state in ["DEL", "DUP"]:
         sub = df[(df["state"] == state) & (df["region_size"] > 0)]
@@ -560,7 +663,8 @@ def build_dashboard(
             continue
         agg = (
             sub.groupby("region_size")
-            .agg(mean_lrr=("lrr", "mean"), mean_baf=("baf", "mean"), n=("lrr", "size"))
+            .agg(mean_lrr=("lrr", "mean"), mean_baf=("baf", "mean"),
+                 n=("lrr", "size"))
             .reset_index()
         )
         fig_size.add_trace(
@@ -571,21 +675,23 @@ def build_dashboard(
                 name=f"{state} mean LRR",
                 marker=dict(
                     color=STATE_COLOURS[state],
-                    size=np.clip(np.log2(agg["n"].values + 1) * 2, 3, 15),
-                    opacity=0.6,
+                    size=np.clip(np.log2(agg["n"].values + 1) * 2, 4, 18),
+                    opacity=0.65,
+                    line=dict(width=0.5, color="rgba(0,0,0,0.3)"),
                 ),
                 text=[f"n={n}" for n in agg["n"]],
+                hovertemplate="%{text}<br>size=%{x:,} bp<br>mean LRR=%{y:.4f}",
             )
         )
     fig_size.update_layout(
         title_text="Truth Region Size vs Mean LRR (DEL / DUP)",
-        xaxis_title="Region size (bp)",
-        yaxis_title="Mean LRR",
-        xaxis_type="log",
-        height=500,
+        xaxis=dict(**_axis_style("Region size (bp)"), type="log"),
+        yaxis=dict(**_axis_style("Mean LRR")),
+        height=520,
+        **_layout_defaults(),
     )
 
-    # ── 6. Per-sample state counts ───────────────────────────────────
+    # ── 7. Per-sample state counts ────────────────────────────────────
     sample_counts = (
         df.groupby(["sample", "state"]).size().unstack(fill_value=0)
     )
@@ -598,19 +704,29 @@ def build_dashboard(
                     y=sample_counts[state].tolist(),
                     name=state,
                     marker_color=STATE_COLOURS[state],
+                    opacity=0.85,
                 )
             )
     fig_samples.update_layout(
         barmode="stack",
-        title_text="Probe Counts per Sample by State",
-        xaxis_title="Sample",
-        yaxis_title="Probe count",
+        title_text="Probe Counts per Sample by Copy-Number State",
+        xaxis=dict(**_axis_style("Sample")),
+        yaxis=dict(**_axis_style("Probe count")),
         height=500,
+        **_layout_defaults(),
     )
 
-    # ── 7. Summary statistics table ──────────────────────────────────
+    # ── 8. Summary statistics table ───────────────────────────────────
     fmt_cols = [c for c in summary.columns if c not in ("state", "metric")]
     header_vals = ["State", "Metric"] + [c.upper() for c in fmt_cols]
+    # Per-column fill colours:
+    #   col 0 (State)  – each cell gets the colour of its copy-number state
+    #   col 1 (Metric) – alternating light-grey / white
+    #   remaining cols – same alternating pattern
+    state_col_colors = [STATE_COLOURS.get(s, "#f9f9f9") for s in summary["state"]]
+    n_rows = len(summary)
+    alt_colors = ["#f9f9f9" if i % 2 == 0 else "#ffffff" for i in range(n_rows)]
+    fill_colors = [state_col_colors] + [alt_colors] * (len(fmt_cols) + 1)
     cell_vals = [
         summary["state"].tolist(),
         summary["metric"].tolist(),
@@ -621,14 +737,29 @@ def build_dashboard(
     fig_table = go.Figure(
         data=[
             go.Table(
-                header=dict(values=header_vals, align="center"),
-                cells=dict(values=cell_vals, align="center"),
+                header=dict(
+                    values=header_vals,
+                    align="center",
+                    fill_color="#4E79A7",
+                    font=dict(color="white", size=12,
+                              family="Arial, Helvetica, sans-serif"),
+                    height=32,
+                ),
+                cells=dict(
+                    values=cell_vals,
+                    align="center",
+                    fill_color=fill_colors,
+                    font=dict(size=11,
+                              family="Arial, Helvetica, sans-serif"),
+                    height=26,
+                ),
             )
         ]
     )
     fig_table.update_layout(
-        title_text="Summary Statistics by State",
-        height=350,
+        title_text="Summary Statistics by Copy-Number State",
+        height=380,
+        **_layout_defaults(),
     )
 
     # ── Assemble HTML ─────────────────────────────────────────────────
@@ -638,13 +769,24 @@ def build_dashboard(
 
     sections = [
         ("Summary Statistics", fig_table),
-        ("LRR &amp; BAF Histograms", fig_hist),
-        ("Violin &amp; Box Plots", fig_violin),
+        ("LRR &amp; BAF Density Distributions", fig_hist),
+        ("DEL vs DUP Comparison (NORMAL excluded)", fig_del_dup),
         ("LRR vs BAF Scatter", fig_scatter),
         ("Per-Chromosome LRR", fig_chrom),
         ("Region Size vs Mean LRR", fig_size),
         ("Per-Sample Probe Counts", fig_samples),
     ]
+
+    # Static violin section with a note pointing to the interactive panel
+    html_parts.append('<div class="section">')
+    html_parts.append('<h2>Violin &amp; Box Plots (full dataset)</h2>')
+    html_parts.append(
+        '<p class="section-note">The interactive filter panel below '
+        'allows you to regenerate violin plots for any chromosome, sample '
+        'and region-size subset in real time.</p>'
+    )
+    html_parts.append(fig_violin.to_html(full_html=False, include_plotlyjs=False))
+    html_parts.append("</div>")
 
     for title, fig in sections:
         html_parts.append(f'<div class="section"><h2>{title}</h2>')
@@ -665,36 +807,160 @@ def build_dashboard(
 
 
 def _html_header() -> str:
-    """Return the HTML head with Plotly CDN and basic styling."""
+    """Return the HTML head with Plotly CDN and publication-quality styling."""
     return """\
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Litmus Test – LRR / BAF Probe Assessment</title>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 <style>
-  body { font-family: Arial, Helvetica, sans-serif; margin: 0; padding: 0;
-         background: #fafafa; color: #333; }
-  .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
-  h1 { text-align: center; margin-bottom: 8px; }
-  .subtitle { text-align: center; color: #666; margin-bottom: 30px; }
-  .section { background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.12);
-             padding: 20px; margin-bottom: 24px; }
-  h2 { margin-top: 0; color: #444; border-bottom: 2px solid #eee; padding-bottom: 8px; }
-  .filter-panel { background: #f0f4f8; border-radius: 8px; padding: 20px;
-                  margin-bottom: 24px; }
-  .filter-panel label { font-weight: bold; margin-right: 10px; }
-  .filter-panel select, .filter-panel input { margin-right: 20px; padding: 4px 8px; }
-  #filtered-stats { margin-top: 16px; }
-  #filtered-plot { margin-top: 16px; }
+  *, *::before, *::after { box-sizing: border-box; }
+  body {
+    font-family: Arial, Helvetica, sans-serif;
+    margin: 0; padding: 0;
+    background: #f2f4f7;
+    color: #2c2c2c;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  .container { max-width: 1440px; margin: 0 auto; padding: 28px 24px; }
+  .report-header {
+    text-align: center;
+    background: linear-gradient(135deg, #1a3a5c 0%, #4E79A7 100%);
+    color: #fff;
+    border-radius: 12px;
+    padding: 32px 20px 24px;
+    margin-bottom: 28px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  }
+  .report-header h1 {
+    margin: 0 0 8px;
+    font-size: 26px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+  }
+  .report-header p {
+    margin: 0;
+    font-size: 14px;
+    opacity: 0.88;
+  }
+  .section {
+    background: #ffffff;
+    border-radius: 10px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    padding: 24px 28px;
+    margin-bottom: 24px;
+    border: 1px solid #e8eaed;
+  }
+  h2 {
+    margin-top: 0;
+    margin-bottom: 4px;
+    color: #1a3a5c;
+    font-size: 17px;
+    font-weight: 600;
+    border-bottom: 2px solid #e8eaed;
+    padding-bottom: 10px;
+  }
+  .section-note {
+    color: #666;
+    font-size: 13px;
+    margin: 4px 0 14px;
+    font-style: italic;
+  }
+  /* ── Filter panel ── */
+  .filter-panel {
+    background: #eef2f7;
+    border: 1px solid #d0d9e6;
+    border-radius: 10px;
+    padding: 24px 28px;
+    margin-bottom: 24px;
+  }
+  .filter-panel h2 { color: #1a3a5c; border-bottom-color: #c5cfe3; }
+  .filter-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 18px;
+    align-items: flex-end;
+    margin-top: 14px;
+  }
+  .filter-group { display: flex; flex-direction: column; gap: 4px; }
+  .filter-group label {
+    font-weight: 600;
+    font-size: 12px;
+    color: #444;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .filter-group select,
+  .filter-group input[type="number"] {
+    padding: 6px 10px;
+    border: 1px solid #b0bcc9;
+    border-radius: 5px;
+    font-size: 13px;
+    background: #fff;
+    color: #2c2c2c;
+    outline: none;
+    transition: border-color 0.2s;
+    min-width: 120px;
+  }
+  .filter-group select:focus,
+  .filter-group input[type="number"]:focus { border-color: #4E79A7; }
+  .lrr-range { display: flex; gap: 6px; align-items: center; }
+  .lrr-range input { min-width: 72px; }
+  .lrr-range span { color: #888; font-size: 13px; }
+  #apply-btn {
+    padding: 8px 22px;
+    background: #4E79A7;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s;
+    align-self: flex-end;
+  }
+  #apply-btn:hover { background: #1a3a5c; }
+  #filtered-stats { margin-top: 18px; }
+  #filtered-plot  { margin-top: 18px; }
+  #filtered-violin { margin-top: 8px; }
+  /* Stats table in filter panel */
+  .stats-table {
+    border-collapse: collapse;
+    width: 100%;
+    margin-top: 10px;
+    font-size: 12px;
+  }
+  .stats-table th {
+    background: #4E79A7;
+    color: #fff;
+    padding: 7px 10px;
+    text-align: center;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+  }
+  .stats-table td {
+    padding: 5px 10px;
+    text-align: center;
+    border-bottom: 1px solid #e8eaed;
+  }
+  .stats-table tr:nth-child(even) td { background: #f5f7fa; }
+  .stats-table tr:last-child td { border-bottom: none; }
+  .badge-DEL    { color: #fff; background:#E15759; border-radius:4px; padding:1px 6px; }
+  .badge-NORMAL { color: #fff; background:#4E79A7; border-radius:4px; padding:1px 6px; }
+  .badge-DUP    { color: #fff; background:#F28E2B; border-radius:4px; padding:1px 6px; }
 </style>
 </head>
 <body>
 <div class="container">
-<h1>Litmus Test – LRR / BAF Probe-Level Assessment</h1>
-<p class="subtitle">Interactive quality dashboard for array probe signals
-   across copy-number states (DEL / NORMAL / DUP)</p>
+<div class="report-header">
+  <h1>Litmus Test &ndash; LRR / BAF Probe-Level Assessment</h1>
+  <p>Interactive quality dashboard for array probe signals across
+     copy-number states (DEL / NORMAL / DUP)</p>
+</div>
 </div>
 """
 
@@ -702,10 +968,10 @@ def _html_header() -> str:
 def _filter_panel_html(df: pd.DataFrame) -> str:
     """Build an interactive filtering panel with embedded data + JS.
 
-    The panel lets users choose a chromosome and an LRR range, then
-    re-renders overlaid histograms for the filtered data on the fly.
+    The panel lets users choose a chromosome, sample, LRR range and minimum
+    region size, then re-renders both density histograms **and violin plots**
+    for the filtered data on the fly using Plotly.js.
     """
-    # Encode lightweight per-state arrays in JSON for JS consumption.
     import json
 
     chroms = sorted(df["chrom"].unique().tolist(), key=_chrom_sort_key)
@@ -734,117 +1000,221 @@ def _filter_panel_html(df: pd.DataFrame) -> str:
     )
 
     return f"""
-<div class="section filter-panel">
-  <h2>Interactive Filtering</h2>
-  <p>Select filters and click <strong>Apply</strong> to regenerate the
-     histograms below using only the matching probes.</p>
-  <div>
-    <label>Chromosome:
+<div class="filter-panel section">
+  <h2>&#9881; Interactive Filter Panel</h2>
+  <p class="section-note">
+    Apply any combination of filters below and click
+    <strong>Apply Filters</strong> to regenerate density histograms,
+    violin plots and summary statistics for the matching probe subset.
+    Violin plots can be further toggled between all states and
+    DEL&nbsp;/&nbsp;DUP only using the checkboxes.
+  </p>
+  <div class="filter-row">
+    <div class="filter-group">
+      <label>Chromosome</label>
       <select id="filt-chrom">
         <option value="ALL" selected>ALL</option>
         {chrom_options}
       </select>
-    </label>
-    <label>Sample:
+    </div>
+    <div class="filter-group">
+      <label>Sample</label>
       <select id="filt-sample">
         <option value="ALL" selected>ALL</option>
         {sample_options}
       </select>
-    </label>
-    <label>Min region size (bp):
+    </div>
+    <div class="filter-group">
+      <label>Min region size (bp)</label>
       <input id="filt-min-size" type="number" value="0" min="0" step="1000"/>
-    </label>
-    <label>LRR range:
-      <input id="filt-lrr-lo" type="number" value="-5" step="0.1" style="width:60px"/>
-      –
-      <input id="filt-lrr-hi" type="number" value="3" step="0.1" style="width:60px"/>
-    </label>
-    <button onclick="applyFilters()">Apply</button>
+    </div>
+    <div class="filter-group">
+      <label>LRR range</label>
+      <div class="lrr-range">
+        <input id="filt-lrr-lo" type="number" value="-5" step="0.1"/>
+        <span>&ndash;</span>
+        <input id="filt-lrr-hi" type="number" value="3" step="0.1"/>
+      </div>
+    </div>
+    <div class="filter-group">
+      <label>Violin states</label>
+      <select id="filt-violin-states">
+        <option value="all" selected>DEL + NORMAL + DUP</option>
+        <option value="sv">DEL + DUP only</option>
+      </select>
+    </div>
+    <button id="apply-btn" onclick="applyFilters()">Apply Filters</button>
   </div>
   <div id="filtered-stats"></div>
-  <div id="filtered-plot"></div>
+  <div id="filtered-plot" style="margin-top:20px;"></div>
+  <div id="filtered-violin" style="margin-top:6px;"></div>
 </div>
 
 <script>
 var _DATA = {data_json};
+var _COLOURS = {{'DEL':'#E15759','NORMAL':'#4E79A7','DUP':'#F28E2B'}};
+var _FONT    = {{family:'Arial, Helvetica, sans-serif', size:13, color:'#2c2c2c'}};
+var _AXFONT  = {{family:'Arial, Helvetica, sans-serif', size:12}};
+// Allowlist of valid state labels to prevent unintended HTML injection
+var _VALID_STATES = {{'DEL':true,'NORMAL':true,'DUP':true}};
+
+function _axis(title) {{
+  return {{
+    title: {{text: title, font: _AXFONT}},
+    tickfont: _AXFONT,
+    showgrid: true, gridcolor: '#ebebeb',
+    zeroline: true, zerolinecolor: '#cccccc'
+  }};
+}}
 
 function applyFilters() {{
-  var chrom  = document.getElementById('filt-chrom').value;
-  var sample = document.getElementById('filt-sample').value;
-  var minSz  = parseFloat(document.getElementById('filt-min-size').value) || 0;
-  var lrrLo  = parseFloat(document.getElementById('filt-lrr-lo').value);
-  var lrrHi  = parseFloat(document.getElementById('filt-lrr-hi').value);
+  var chrom     = document.getElementById('filt-chrom').value;
+  var sample    = document.getElementById('filt-sample').value;
+  var minSz     = parseFloat(document.getElementById('filt-min-size').value) || 0;
+  var lrrLo     = parseFloat(document.getElementById('filt-lrr-lo').value);
+  var lrrHi     = parseFloat(document.getElementById('filt-lrr-hi').value);
+  var violinSts = document.getElementById('filt-violin-states').value;
 
-  var filtered = {{}};  // state -> {{lrr:[], baf:[]}}
-  var counts   = {{}};
+  var filtered = {{}};
   var n = _DATA.chrom.length;
   for (var i = 0; i < n; i++) {{
-    if (chrom !== 'ALL' && _DATA.chrom[i] !== chrom) continue;
+    if (chrom  !== 'ALL' && _DATA.chrom[i]  !== chrom)  continue;
     if (sample !== 'ALL' && _DATA.sample[i] !== sample) continue;
     if (_DATA.region_size[i] < minSz && _DATA.state[i] !== 'NORMAL') continue;
     if (_DATA.lrr[i] < lrrLo || _DATA.lrr[i] > lrrHi) continue;
     var st = _DATA.state[i];
-    if (!filtered[st]) {{ filtered[st] = {{lrr:[], baf:[]}}; counts[st] = 0; }}
+    if (!_VALID_STATES[st]) continue;  // skip any unexpected state label
+    if (!filtered[st]) filtered[st] = {{lrr:[], baf:[]}};
     filtered[st].lrr.push(_DATA.lrr[i]);
     filtered[st].baf.push(_DATA.baf[i]);
-    counts[st]++;
   }}
 
-  // Summary text
-  var html = '<table border="1" cellpadding="4" style="border-collapse:collapse; margin-top:8px;">';
-  html += '<tr><th>State</th><th>N</th><th>LRR mean</th><th>LRR median</th><th>LRR std</th>';
-  html += '<th>BAF mean</th><th>BAF median</th><th>BAF std</th></tr>';
+  /* ── Summary table ──────────────────────────────────── */
+  var rows = '';
   ['DEL','NORMAL','DUP'].forEach(function(st) {{
     if (!filtered[st]) return;
     var lrr = filtered[st].lrr.slice().sort(function(a,b){{return a-b;}});
     var baf = filtered[st].baf.slice().sort(function(a,b){{return a-b;}});
-    var lrrM = mean(lrr), lrrMed = median(lrr), lrrS = std(lrr);
-    var bafM = mean(baf), bafMed = median(baf), bafS = std(baf);
-    html += '<tr><td>'+st+'</td><td>'+lrr.length+'</td>';
-    html += '<td>'+lrrM.toFixed(4)+'</td><td>'+lrrMed.toFixed(4)+'</td><td>'+lrrS.toFixed(4)+'</td>';
-    html += '<td>'+bafM.toFixed(4)+'</td><td>'+bafMed.toFixed(4)+'</td><td>'+bafS.toFixed(4)+'</td></tr>';
+    rows += '<tr>'
+      + '<td><span class="badge-'+st+'">'+st+'</span></td>'
+      + '<td>'+lrr.length.toLocaleString()+'</td>'
+      + '<td>'+mean(lrr).toFixed(4)+'</td>'
+      + '<td>'+median(lrr).toFixed(4)+'</td>'
+      + '<td>'+std(lrr).toFixed(4)+'</td>'
+      + '<td>'+mean(baf).toFixed(4)+'</td>'
+      + '<td>'+median(baf).toFixed(4)+'</td>'
+      + '<td>'+std(baf).toFixed(4)+'</td>'
+      + '</tr>';
   }});
-  html += '</table>';
-  document.getElementById('filtered-stats').innerHTML = html;
+  document.getElementById('filtered-stats').innerHTML =
+    '<table class="stats-table"><thead><tr>'
+    + '<th>State</th><th>N</th>'
+    + '<th>LRR mean</th><th>LRR median</th><th>LRR std</th>'
+    + '<th>BAF mean</th><th>BAF median</th><th>BAF std</th>'
+    + '</tr></thead><tbody>' + rows + '</tbody></table>';
 
-  // Plotly traces
-  var traces = [];
-  var colours = {{'DEL':'#d62728','NORMAL':'#2ca02c','DUP':'#1f77b4'}};
+  /* ── Density histograms ─────────────────────────────── */
+  var histTraces = [];
   ['DEL','NORMAL','DUP'].forEach(function(st) {{
     if (!filtered[st]) return;
-    traces.push({{
-      x: filtered[st].lrr, type:'histogram', name: st+' LRR',
-      marker:{{color:colours[st]}}, opacity:0.6, nbinsx:150, xaxis:'x', yaxis:'y'
+    histTraces.push({{
+      x: filtered[st].lrr, type:'histogram',
+      name: st + ' (n=' + filtered[st].lrr.length.toLocaleString() + ')',
+      marker:{{color:_COLOURS[st]}}, opacity:0.65, nbinsx:120,
+      histnorm:'probability density', xaxis:'x', yaxis:'y',
+      legendgroup: st
     }});
-    traces.push({{
-      x: filtered[st].baf, type:'histogram', name: st+' BAF',
-      marker:{{color:colours[st]}}, opacity:0.6, nbinsx:150, xaxis:'x2', yaxis:'y2'
+    histTraces.push({{
+      x: filtered[st].baf, type:'histogram',
+      name: st + ' BAF',
+      marker:{{color:_COLOURS[st]}}, opacity:0.65, nbinsx:120,
+      histnorm:'probability density', xaxis:'x2', yaxis:'y2',
+      legendgroup: st, showlegend: false
     }});
   }});
-  var layout = {{
+  var histLayout = {{
+    template: 'plotly_white',
+    font: _FONT,
     grid: {{rows:1, columns:2, pattern:'independent'}},
-    barmode:'overlay', height:450,
-    xaxis: {{title:'LRR'}}, yaxis: {{title:'Count'}},
-    xaxis2:{{title:'BAF'}}, yaxis2:{{title:'Count'}},
-    title:'Filtered LRR & BAF Histograms'
+    barmode:'overlay', height:480,
+    xaxis:  _axis('LRR'),  yaxis:  _axis('Probability Density'),
+    xaxis2: _axis('BAF'),  yaxis2: _axis('Probability Density'),
+    title: {{text:'Filtered LRR &amp; BAF Probability Density', font:{{size:15}}}},
+    legend: {{bgcolor:'rgba(255,255,255,0.8)', bordercolor:'#ccc', borderwidth:1}},
+    margin: {{l:70, r:30, t:60, b:55}}
   }};
-  Plotly.newPlot('filtered-plot', traces, layout);
+  Plotly.react('filtered-plot', histTraces, histLayout);
+
+  /* ── Violin plots ───────────────────────────────────── */
+  var stateList = (violinSts === 'sv') ? ['DEL','DUP'] : ['DEL','NORMAL','DUP'];
+  var violinTraces = [];
+  stateList.forEach(function(st) {{
+    if (!filtered[st] || !filtered[st].lrr.length) return;
+    violinTraces.push({{
+      y: filtered[st].lrr, type:'violin',
+      name: st, legendgroup: st,
+      side: 'both',
+      box: {{visible: true}},
+      meanline: {{visible: true}},
+      fillcolor: _COLOURS[st],
+      line: {{color: _COLOURS[st]}},
+      opacity: 0.75,
+      points: false,
+      xaxis: 'x3', yaxis: 'y3',
+      showlegend: true
+    }});
+    violinTraces.push({{
+      y: filtered[st].baf, type:'violin',
+      name: st, legendgroup: st,
+      side: 'both',
+      box: {{visible: true}},
+      meanline: {{visible: true}},
+      fillcolor: _COLOURS[st],
+      line: {{color: _COLOURS[st]}},
+      opacity: 0.75,
+      points: false,
+      xaxis: 'x4', yaxis: 'y4',
+      showlegend: false
+    }});
+  }});
+  var violinLayout = {{
+    template: 'plotly_white',
+    font: _FONT,
+    grid: {{rows:1, columns:2, pattern:'independent'}},
+    violinmode: 'group',
+    height: 520,
+    xaxis3: {{title: {{text:'State', font:_AXFONT}}, tickfont:_AXFONT, showgrid:false}},
+    yaxis3: _axis('LRR'),
+    xaxis4: {{title: {{text:'State', font:_AXFONT}}, tickfont:_AXFONT, showgrid:false}},
+    yaxis4: _axis('BAF'),
+    title: {{text:'Filtered Violin + Box Plots', font:{{size:15}}}},
+    legend: {{bgcolor:'rgba(255,255,255,0.8)', bordercolor:'#ccc', borderwidth:1}},
+    margin: {{l:70, r:30, t:60, b:55}},
+    annotations: [
+      {{text:'LRR', xref:'paper', yref:'paper', x:0.23, y:1.05,
+        showarrow:false, font:{{size:13, color:'#555'}}}},
+      {{text:'BAF', xref:'paper', yref:'paper', x:0.77, y:1.05,
+        showarrow:false, font:{{size:13, color:'#555'}}}}
+    ]
+  }};
+  Plotly.react('filtered-violin', violinTraces, violinLayout);
 }}
 
 function mean(arr) {{
   if (!arr.length) return 0;
-  var s = 0; for (var i=0;i<arr.length;i++) s+=arr[i]; return s/arr.length;
+  var s = 0; for (var i = 0; i < arr.length; i++) s += arr[i];
+  return s / arr.length;
 }}
 function median(arr) {{
   if (!arr.length) return 0;
-  var m = Math.floor(arr.length/2);
-  return arr.length%2 ? arr[m] : (arr[m-1]+arr[m])/2;
+  var m = Math.floor(arr.length / 2);
+  return arr.length % 2 ? arr[m] : (arr[m - 1] + arr[m]) / 2;
 }}
 function std(arr) {{
-  if (arr.length<2) return 0;
+  if (arr.length < 2) return 0;
   var m = mean(arr), s = 0;
-  for (var i=0;i<arr.length;i++) s+=(arr[i]-m)*(arr[i]-m);
-  return Math.sqrt(s/(arr.length-1));
+  for (var i = 0; i < arr.length; i++) s += (arr[i] - m) * (arr[i] - m);
+  return Math.sqrt(s / (arr.length - 1));
 }}
 </script>
 """
