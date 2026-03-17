@@ -357,7 +357,7 @@ class TestLitmusPipeline:
         assert "plotly" in content.lower()
 
     def test_html_contains_all_sections(self, litmus_data, tmp_path):
-        """All 7 dashboard sections and the interactive filter panel must be present."""
+        """All dashboard sections and the interactive filter panel must be present."""
         df, summary = litmus_data
         html_path = str(tmp_path / "litmus_sections.html")
         build_dashboard(df, summary, html_path)
@@ -366,10 +366,10 @@ class TestLitmusPipeline:
             content = f.read()
 
         for section in (
-            "Summary Statistics",
+            "About This Report",
             "LRR",
             "BAF",
-            "Violin",
+            "Summary Statistics",
             "Scatter",
             "Per-Chromosome",
             "Per-Sample",
