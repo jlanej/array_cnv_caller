@@ -1,0 +1,36 @@
+# T2T CHM13 v2.0 centromere regions (alpha-satellite arrays)
+# Assembly: T2T-CHM13 v2.0 (GCA_009914755.4)
+# Source: Altemose N et al. "Complete genomic and epigenetic maps of human centromeres."
+#   Science. 2022;376(6588):eabl4178. doi:10.1126/science.abl4178
+#   Coordinates derived from Table S2 (active HOR array boundaries in CHM13v2.0) with
+#   ±500 kb pericentromeric flanks added to capture satellite-dense transition zones.
+# Canonical cenSat v2.0 track (direct download from T2T / Human Pangenomics S3 bucket):
+#   https://s3-us-west-2.amazonaws.com/human-pangenomics/T2T/CHM13/assemblies/annotation/chm13v2.0_censat_v2.0.bed
+# Also browseable via UCSC T2T hub:
+#   https://genome.ucsc.edu/cgi-bin/hgGateway?db=hub_3671779_GCA_009914755.4
+# Coordinates are 0-based, half-open (BED format).
+# See resources/blacklists/SOURCES.md for full citation details.
+chr1	120875000	144510000	centromere
+chr2	88430000	100000000	centromere
+chr3	89000000	100000000	centromere
+chr4	48600000	57000000	centromere
+chr5	46600000	51300000	centromere
+chr6	57900000	62000000	centromere
+chr7	60100000	62600000	centromere
+chr8	43800000	46900000	centromere
+chr9	42400000	52000000	centromere
+chr10	39200000	42200000	centromere
+chr11	50400000	57200000	centromere
+chr12	33200000	37400000	centromere
+chr13	15000000	18300000	centromere
+chr14	14500000	17700000	centromere
+chr15	14900000	18100000	centromere
+chr16	35300000	39600000	centromere
+chr17	24600000	28000000	centromere
+chr18	15700000	22400000	centromere
+chr19	25700000	30100000	centromere
+chr20	27700000	31200000	centromere
+chr21	10500000	13900000	centromere
+chr22	13000000	17200000	centromere
+chrX	60400000	67400000	centromere
+chrY	10200000	12100000	centromere
